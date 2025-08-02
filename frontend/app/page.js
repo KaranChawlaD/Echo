@@ -1,7 +1,7 @@
 "use client"
 
-import { useState } from 'react';
-import { Phone, Download, MessageSquare, Heart, Clock, CheckCircle, AlertCircle, RefreshCw } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { Phone, Download, MessageSquare, Heart, Clock, CheckCircle, AlertCircle, RefreshCw, Volume2, VolumeX, Play, Pause } from 'lucide-react';
 
 export default function Dashboard() {
   const [helpRequest, setHelpRequest] = useState('');
@@ -11,12 +11,149 @@ export default function Dashboard() {
   const [callId, setCallId] = useState(null);
   const [debugInfo, setDebugInfo] = useState(''); // For debugging
   const [pollCount, setPollCount] = useState(0); // Track polling attempts
+  
+  // Audio-related state
+  const [isListening, setIsListening] = useState(false);
+  const [audioUrl, setAudioUrl] = useState(null);
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+  const [audioError, setAudioError] = useState(null);
+  const [recordingAvailable, setRecordingAvailable] = useState(false);
+  
+  // Refs for audio handling
+  const audioRef = useRef(null);
+  const wsRef = useRef(null);
 
   const addDebugInfo = (message) => {
     const timestamp = new Date().toLocaleTimeString();
     setDebugInfo(prev => `${prev}\n[${timestamp}] ${message}`);
     console.log(`[${timestamp}] ${message}`);
   };
+
+  // WebSocket connection for live audio
+  const connectToLiveAudio = (callId) => {
+    if (!callId) return;
+    
+    try {
+      addDebugInfo('Connecting to live audio stream...');
+      const wsUrl = `ws://localhost:3002/audio-stream/${callId}`;
+      wsRef.current = new WebSocket(wsUrl);
+      
+      wsRef.current.onopen = () => {
+        addDebugInfo('Live audio connection established');
+        setIsListening(true);
+        setAudioError(null);
+      };
+      
+      wsRef.current.onmessage = (event) => {
+        // Handle incoming audio data
+        if (audioRef.current && event.data) {
+          try {
+            // Convert received audio data to blob and play
+            const audioBlob = new Blob([event.data], { type: 'audio/wav' });
+            const audioUrl = URL.createObjectURL(audioBlob);
+            
+            if (audioRef.current.src) {
+              URL.revokeObjectURL(audioRef.current.src);
+            }
+            
+            audioRef.current.src = audioUrl;
+            // Auto-play live audio (might require user interaction first)
+            audioRef.current.play().catch(err => {
+              addDebugInfo(`Audio autoplay failed: ${err.message}`);
+            });
+          } catch (err) {
+            addDebugInfo(`Error playing live audio: ${err.message}`);
+          }
+        }
+      };
+      
+      wsRef.current.onerror = (error) => {
+        addDebugInfo(`Live audio connection error: ${error}`);
+        setAudioError('Failed to connect to live audio stream');
+        setIsListening(false);
+      };
+      
+      wsRef.current.onclose = () => {
+        addDebugInfo('Live audio connection closed');
+        setIsListening(false);
+      };
+      
+    } catch (error) {
+      addDebugInfo(`Failed to establish live audio connection: ${error.message}`);
+      setAudioError('Could not connect to live audio');
+    }
+  };
+
+  // Disconnect from live audio
+  const disconnectLiveAudio = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setIsListening(false);
+    if (audioRef.current) {
+      audioRef.current.pause();
+      if (audioRef.current.src) {
+        URL.revokeObjectURL(audioRef.current.src);
+        audioRef.current.src = '';
+      }
+    }
+  };
+
+  // Toggle live audio listening
+  const toggleLiveAudio = () => {
+    if (isListening) {
+      disconnectLiveAudio();
+    } else if (callId && callStatus === 'calling') {
+      connectToLiveAudio(callId);
+    }
+  };
+
+  // Download audio recording
+  const downloadAudioRecording = async () => {
+    if (!callId || !recordingAvailable) return;
+    
+    try {
+      addDebugInfo('Downloading audio recording...');
+      const response = await fetch(`http://localhost:3002/api/call-recording/${callId}`);
+      
+      if (!response.ok) {
+        throw new Error('Failed to download recording');
+      }
+      
+      const audioBlob = await response.blob();
+      const url = URL.createObjectURL(audioBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `support-call-recording-${new Date().toISOString().split('T')[0]}.mp3`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      addDebugInfo('Audio recording downloaded');
+    } catch (error) {
+      addDebugInfo(`Error downloading audio: ${error.message}`);
+      setAudioError('Failed to download recording');
+    }
+  };
+
+  // Play/pause recorded audio
+  const toggleAudioPlayback = () => {
+    if (!audioRef.current || !audioUrl) return;
+    
+    if (isAudioPlaying) {
+      audioRef.current.pause();
+    } else {
+      audioRef.current.play().catch(err => {
+        setAudioError(`Playback failed: ${err.message}`);
+      });
+    }
+  };
+
+  // Handle audio events
+  const handleAudioPlay = () => setIsAudioPlaying(true);
+  const handleAudioPause = () => setIsAudioPlaying(false);
+  const handleAudioEnded = () => setIsAudioPlaying(false);
 
   const handleSubmitRequest = async () => {
     if (!helpRequest.trim()) return;
@@ -25,6 +162,9 @@ export default function Dashboard() {
     setCallStatus('calling');
     setDebugInfo('');
     setPollCount(0);
+    setAudioUrl(null);
+    setRecordingAvailable(false);
+    setAudioError(null);
     addDebugInfo('Starting call request...');
     
     try {
@@ -79,12 +219,22 @@ export default function Dashboard() {
         
         if (response.ok) {
           if (data.status === 'completed') {
-            addDebugInfo('Call completed! Setting transcript...');
+            addDebugInfo('Call completed! Setting transcript and checking for recording...');
             setCallStatus('completed');
             setTranscript(data.transcript);
+            setRecordingAvailable(data.recordingAvailable || false);
+            
+            // Get the recorded audio URL if available
+            if (data.recordingAvailable) {
+              setAudioUrl(`http://localhost:3002/api/call-recording/${callId}`);
+            }
+            
+            // Disconnect live audio
+            disconnectLiveAudio();
           } else if (data.status === 'error' || data.status === 'failed') {
             addDebugInfo(`Call failed with status: ${data.status}`);
             setCallStatus('error');
+            disconnectLiveAudio();
           } else {
             // Continue polling for other statuses
             addDebugInfo(`Call still in progress (${data.status}), continuing to poll...`);
@@ -93,6 +243,7 @@ export default function Dashboard() {
         } else {
           addDebugInfo(`Status check failed: ${JSON.stringify(data)}`);
           setCallStatus('error');
+          disconnectLiveAudio();
         }
       } catch (error) {
         addDebugInfo(`Error checking call status: ${error.message}`);
@@ -101,6 +252,7 @@ export default function Dashboard() {
           setTimeout(checkStatus, 3000);
         } else {
           setCallStatus('error');
+          disconnectLiveAudio();
         }
       }
     };
@@ -130,6 +282,10 @@ export default function Dashboard() {
     setCallId(null);
     setDebugInfo('');
     setPollCount(0);
+    setAudioUrl(null);
+    setRecordingAvailable(false);
+    setAudioError(null);
+    disconnectLiveAudio();
     addDebugInfo('Form reset');
   };
 
@@ -145,38 +301,38 @@ export default function Dashboard() {
     }
   };
 
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      disconnectLiveAudio();
+      if (audioUrl && audioUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(audioUrl);
+      }
+    };
+  }, [audioUrl]);
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
       <div className="container mx-auto px-4 py-8">
         <div className="max-w-4xl mx-auto">
+          {/* Audio element for playback */}
+          <audio
+            ref={audioRef}
+            onPlay={handleAudioPlay}
+            onPause={handleAudioPause}
+            onEnded={handleAudioEnded}
+            style={{ display: 'none' }}
+          />
+
           {/* Header */}
           <div className="text-center mb-3">
             <div className="flex items-center justify-center gap-3 mb-4">
-              {/* <Heart className="w-8 h-8 text-red-500" /> */}
               <h1 className="text-6xl font-bold text-[#da63e1]">Echo</h1>
             </div>
             <p className="text-lg text-[#03060f] max-w-2xl mx-auto">
               When asking for help feels difficult, let our AI agent speak for you. 
             </p>
           </div>
-
-          {/* Debug Panel (shows in development) */}
-          {/* {debugInfo && (
-            <div className="mb-6 bg-gray-100 border rounded-lg p-4">
-              <div className="flex justify-between items-center mb-2">
-                <h4 className="font-medium text-gray-700">Debug Info</h4>
-                <button 
-                  onClick={testConnection}
-                  className="text-sm px-3 py-1 bg-blue-500 text-white rounded hover:bg-blue-600"
-                >
-                  Test Connection
-                </button>
-              </div>
-              <pre className="text-xs text-gray-600 whitespace-pre-wrap max-h-40 overflow-y-auto bg-white p-2 rounded border">
-                {debugInfo}
-              </pre>
-            </div>
-          )} */}
 
           {/* Status indicator at top */}
           <div className="mb-5 text-center">
@@ -197,6 +353,18 @@ export default function Dashboard() {
                 <span className="text-xs text-gray-400">
                   ID: {callId.substring(0, 8)}...
                 </span>
+              )}
+              {/* Live audio indicator */}
+              {callStatus === 'calling' && (
+                <div className="flex items-center gap-1 ml-2 text-xs">
+                  {isListening ? (
+                    <><Volume2 className="w-3 h-3 text-green-500" />
+                    <span className="text-green-600">Live</span></>
+                  ) : (
+                    <><VolumeX className="w-3 h-3 text-gray-400" />
+                    <span className="text-gray-500">Audio Off</span></>
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -250,6 +418,42 @@ export default function Dashboard() {
                     <span>Poll attempt #{pollCount}</span>
                   </div>
                 </div>
+
+                {/* Live Audio Controls */}
+                <div className="bg-blue-50 p-6 rounded-lg">
+                  <h4 className="font-semibold text-blue-800 mb-3">Live Audio</h4>
+                  {audioError && (
+                    <div className="text-red-600 text-sm mb-3">
+                      {audioError}
+                    </div>
+                  )}
+                  <div className="flex justify-center gap-4">
+                    <button
+                      onClick={toggleLiveAudio}
+                      className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+                        isListening 
+                          ? 'bg-red-500 hover:bg-red-600 text-white' 
+                          : 'bg-green-500 hover:bg-green-600 text-white'
+                      }`}
+                    >
+                      {isListening ? (
+                        <>
+                          <VolumeX className="w-4 h-4" />
+                          Stop Listening
+                        </>
+                      ) : (
+                        <>
+                          <Volume2 className="w-4 h-4" />
+                          Listen Live
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <p className="text-xs text-blue-600 mt-2">
+                    Click "Listen Live" to hear the conversation in real-time
+                  </p>
+                </div>
+
                 <div className="bg-blue-50 p-4 rounded-lg">
                   <p className="text-sm text-blue-800">
                     <strong>Your Request:</strong> "{helpRequest}"
@@ -273,7 +477,7 @@ export default function Dashboard() {
                     Call Completed Successfully
                   </h3>
                   <p className="text-gray-600">
-                    Your support request has been communicated. The conversation transcript is ready for download.
+                    Your support request has been communicated. The conversation transcript and recording are ready for download.
                   </p>
                 </div>
 
@@ -282,6 +486,41 @@ export default function Dashboard() {
                   <p className="text-green-700 mb-4">
                     Our AI agent successfully conveyed your request for help and received a supportive response.
                   </p>
+                  
+                  {/* Audio Playback Section */}
+                  {recordingAvailable && (
+                    <div className="bg-white p-4 rounded border mb-4">
+                      <h5 className="font-medium text-gray-800 mb-3">Call Recording</h5>
+                      <div className="flex items-center gap-3 mb-3">
+                        <button
+                          onClick={toggleAudioPlayback}
+                          className="flex items-center gap-2 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                        >
+                          {isAudioPlaying ? (
+                            <>
+                              <Pause className="w-4 h-4" />
+                              Pause
+                            </>
+                          ) : (
+                            <>
+                              <Play className="w-4 h-4" />
+                              Play Recording
+                            </>
+                          )}
+                        </button>
+                        {audioUrl && (
+                          <audio
+                            src={audioUrl}
+                            controls
+                            className="flex-1"
+                            onPlay={handleAudioPlay}
+                            onPause={handleAudioPause}
+                            onEnded={handleAudioEnded}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
                   
                   {transcript && (
                     <div className="bg-white p-4 rounded border mb-4">
@@ -292,7 +531,17 @@ export default function Dashboard() {
                     </div>
                   )}
                   
-                  <div className="flex gap-4 justify-center">
+                  <div className="flex gap-4 justify-center flex-wrap">
+                    {recordingAvailable && (
+                      <button
+                        onClick={downloadAudioRecording}
+                        className="flex items-center gap-2 px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors"
+                      >
+                        <Download className="w-4 h-4" />
+                        Download Recording
+                      </button>
+                    )}
+                    
                     <button
                       onClick={downloadTranscript}
                       disabled={!transcript}
@@ -370,18 +619,16 @@ export default function Dashboard() {
                 <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-2">
                   <span className="text-[#3b5bd9] font-semibold">2</span>
                 </div>
-                <p>Our AI agent calls your support person</p>
+                <p>Our AI agent calls and you can listen live</p>
               </div>
               <div className="text-center">
                 <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-2">
                   <span className="text-[#3b5bd9] font-semibold">3</span>
                 </div>
-                <p>Receive a full overview of the conversation</p>
+                <p>Download transcript and audio recording</p>
               </div>
             </div>
           </div>
-
-          
         </div>
       </div>
     </div>

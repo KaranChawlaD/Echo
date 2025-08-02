@@ -2,24 +2,91 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const WebSocket = require('ws');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 const PORT = process.env.PORT || 3002;
+
+// Create recordings directory if it doesn't exist
+const recordingsDir = path.join(__dirname, 'recordings');
+if (!fs.existsSync(recordingsDir)) {
+  fs.mkdirSync(recordingsDir, { recursive: true });
+}
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// In-memory storage for call data (use a database in production)
+// In-memory storage for call data and WebSocket connections
 const callDatabase = new Map();
+const liveConnections = new Map(); // callId -> WebSocket connections
 
 // Vapi configuration
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
-const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID; // Your Vapi phone number ID
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID; // Pre-configured assistant ID
-const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER; // The hotline number to call
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID;
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
+const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER;
 const FLY_MODEL = process.env.FLY_MODEL;
+
+// WebSocket handling for live audio streams
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathParts = url.pathname.split('/');
+  
+  if (pathParts[1] === 'audio-stream' && pathParts[2]) {
+    const callId = pathParts[2];
+    console.log(`Live audio connection established for call: ${callId}`);
+    
+    // Store the connection
+    if (!liveConnections.has(callId)) {
+      liveConnections.set(callId, []);
+    }
+    liveConnections.get(callId).push(ws);
+    
+    // Send confirmation
+    ws.send(JSON.stringify({ type: 'connected', callId }));
+    
+    ws.on('close', () => {
+      console.log(`Live audio connection closed for call: ${callId}`);
+      const connections = liveConnections.get(callId);
+      if (connections) {
+        const index = connections.indexOf(ws);
+        if (index > -1) {
+          connections.splice(index, 1);
+        }
+        if (connections.length === 0) {
+          liveConnections.delete(callId);
+        }
+      }
+    });
+    
+    ws.on('error', (error) => {
+      console.error(`WebSocket error for call ${callId}:`, error);
+    });
+  }
+});
+
+// Broadcast audio data to live listeners
+const broadcastAudioToListeners = (callId, audioData) => {
+  const connections = liveConnections.get(callId);
+  if (connections && connections.length > 0) {
+    connections.forEach(ws => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(audioData);
+        } catch (error) {
+          console.error(`Failed to send audio data to WebSocket:`, error);
+        }
+      }
+    });
+  }
+};
 
 // AI Agent prompt template
 const createAgentPrompt = (helpRequest) => {
@@ -86,6 +153,52 @@ const makeVapiRequest = async (endpoint, data, method = 'POST') => {
   }
 };
 
+// Download and save recording from Vapi
+const downloadRecording = async (vapiCallId, callId) => {
+  try {
+    console.log(`Downloading recording for Vapi call: ${vapiCallId}`);
+    
+    // Get recording URL from Vapi
+    const callDetails = await makeVapiRequest(`call/${vapiCallId}`, null, 'GET');
+    
+    if (callDetails && callDetails.artifact && callDetails.artifact.recordingUrl) {
+      console.log(`Recording URL obtained: ${recordingData.recordingUrl}`);
+      
+      // Download the audio file
+      const response = await fetch(recordingData.recordingUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to download recording: ${response.statusText}`);
+      }
+      
+      const audioBuffer = await response.buffer();
+      const recordingPath = path.join(recordingsDir, `${callId}.mp3`);
+      
+      fs.writeFileSync(recordingPath, audioBuffer);
+      console.log(`Recording saved to: ${recordingPath}`);
+      
+      return recordingPath;
+    } else {
+      console.log('No recording URL available');
+      return null;
+    }
+  } catch (error) {
+    console.error('Error downloading recording:', error);
+    return null;
+  }
+};
+
+// Create mock recording for testing
+const createMockRecording = (callId, helpRequest) => {
+  const recordingPath = path.join(recordingsDir, `${callId}.mp3`);
+  
+  // Create a placeholder audio file (in real implementation, this would be actual audio)
+  const mockAudioData = Buffer.from('Mock audio recording data - ' + helpRequest);
+  fs.writeFileSync(recordingPath, mockAudioData);
+  
+  console.log(`Mock recording created: ${recordingPath}`);
+  return recordingPath;
+};
+
 // Routes
 
 // Initiate a support call
@@ -114,10 +227,28 @@ app.post('/api/initiate-call', async (req, res) => {
         assistantId: 'mock-assistant-' + callId,
         helpRequest,
         status: 'queued',
-        frontendStatus: 'calling', // Add frontend-friendly status
+        frontendStatus: 'calling',
         createdAt: new Date().toISOString(),
         transcript: null,
+        recordingPath: null,
+        recordingAvailable: false,
       });
+      
+      // Simulate live audio streaming
+      setTimeout(() => {
+        console.log(`Starting mock audio stream for call ${callId}`);
+        const interval = setInterval(() => {
+          // Simulate audio data chunks
+          const mockAudioChunk = Buffer.from(`Mock audio chunk ${Date.now()}`);
+          broadcastAudioToListeners(callId, mockAudioChunk);
+        }, 1000);
+        
+        // Stop streaming when call completes
+        setTimeout(() => {
+          clearInterval(interval);
+          console.log(`Mock audio stream ended for call ${callId}`);
+        }, 13000);
+      }, 3000);
       
       // Simulate call progression
       setTimeout(() => {
@@ -148,10 +279,16 @@ app.post('/api/initiate-call', async (req, res) => {
           mockCall.frontendStatus = 'completed';
           mockCall.transcript = formatMockTranscript(helpRequest);
           mockCall.completedAt = new Date().toISOString();
+          
+          // Create mock recording
+          const recordingPath = createMockRecording(callId, helpRequest);
+          mockCall.recordingPath = recordingPath;
+          mockCall.recordingAvailable = true;
+          
           callDatabase.set(callId, mockCall);
-          console.log(`Mock call ${callId} completed with transcript`);
+          console.log(`Mock call ${callId} completed with transcript and recording`);
         }
-      }, 15000); // Reduced from 30 seconds to 15 for faster testing
+      }, 15000);
       
       return res.json({
         success: true,
@@ -207,6 +344,8 @@ app.post('/api/initiate-call', async (req, res) => {
         frontendStatus: mapVapiStatusToFrontend(initialStatus),
         createdAt: new Date().toISOString(),
         transcript: null,
+        recordingPath: null,
+        recordingAvailable: false,
       });
 
       return res.json({
@@ -239,7 +378,7 @@ app.post('/api/initiate-call', async (req, res) => {
       recordingEnabled: true,
       endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing. Have a wonderful day.`,
       endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye', 'have a good day'],
-      maxDurationSeconds: 180, // 5 minutes max for testing
+      maxDurationSeconds: 300, // 5 minutes max
       silenceTimeoutSeconds: 15,
       responseDelaySeconds: 1,
     };
@@ -277,6 +416,8 @@ app.post('/api/initiate-call', async (req, res) => {
       frontendStatus: mapVapiStatusToFrontend(initialStatus),
       createdAt: new Date().toISOString(),
       transcript: null,
+      recordingPath: null,
+      recordingAvailable: false,
     });
 
     console.log('Call data stored for ID:', callId);
@@ -319,6 +460,7 @@ app.get('/api/call-status/:callId', async (req, res) => {
         helpRequest: callData.helpRequest,
         createdAt: callData.createdAt,
         completedAt: callData.completedAt,
+        recordingAvailable: callData.recordingAvailable,
       });
     }
     
@@ -333,7 +475,7 @@ app.get('/api/call-status/:callId', async (req, res) => {
       callData.frontendStatus = mapVapiStatusToFrontend(vapiCallData.status);
       callData.duration = vapiCallData.duration;
       
-      // If call ended, get transcript
+      // If call ended, get transcript and recording
       if (vapiCallData.status === 'ended') {
         if (vapiCallData.transcript) {
           callData.transcript = formatTranscript(vapiCallData.transcript);
@@ -345,18 +487,30 @@ app.get('/api/call-status/:callId', async (req, res) => {
         if (!callData.completedAt) {
           callData.completedAt = new Date().toISOString();
         }
+        
+        // Download recording if available
+        if (vapiCallData.recordingEnabled && !callData.recordingPath) {
+          console.log(`Attempting to download recording for call ${callId}`);
+          const recordingPath = await downloadRecording(callData.vapiCallId, callId);
+          if (recordingPath) {
+            callData.recordingPath = recordingPath;
+            callData.recordingAvailable = true;
+            console.log(`Recording downloaded for call ${callId}`);
+          }
+        }
       }
       
       callDatabase.set(callId, callData);
       
       res.json({
-        status: callData.frontendStatus, // Use frontend-friendly status
+        status: callData.frontendStatus,
         transcript: callData.transcript,
         helpRequest: callData.helpRequest,
         createdAt: callData.createdAt,
         completedAt: callData.completedAt,
         duration: callData.duration,
         endedReason: callData.endedReason,
+        recordingAvailable: callData.recordingAvailable,
       });
       
     } catch (vapiError) {
@@ -368,6 +522,7 @@ app.get('/api/call-status/:callId', async (req, res) => {
         helpRequest: callData.helpRequest,
         createdAt: callData.createdAt,
         completedAt: callData.completedAt,
+        recordingAvailable: callData.recordingAvailable,
         error: 'Could not fetch latest status from Vapi',
       });
     }
@@ -381,10 +536,56 @@ app.get('/api/call-status/:callId', async (req, res) => {
   }
 });
 
+// Download call recording
+app.get('/api/call-recording/:callId', async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const callData = callDatabase.get(callId);
+    
+    if (!callData) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    if (!callData.recordingAvailable || !callData.recordingPath) {
+      return res.status(404).json({ error: 'Recording not available' });
+    }
+    
+    const recordingPath = callData.recordingPath;
+    
+    if (!fs.existsSync(recordingPath)) {
+      return res.status(404).json({ error: 'Recording file not found' });
+    }
+    
+    console.log(`Serving recording for call ${callId}: ${recordingPath}`);
+    
+    // Set appropriate headers for audio download
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="call-recording-${callId}.mp3"`);
+    
+    // Stream the file
+    const fileStream = fs.createReadStream(recordingPath);
+    fileStream.pipe(res);
+    
+    fileStream.on('error', (error) => {
+      console.error('Error streaming recording:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream recording' });
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error downloading recording:', error);
+    res.status(500).json({ 
+      error: 'Failed to download recording',
+      details: error.message 
+    });
+  }
+});
+
 // Webhook endpoint for real-time updates
 app.post('/api/webhook/vapi', (req, res) => {
   try {
-    const { type, call } = req.body;
+    const { type, call, message } = req.body;
     
     console.log(`Vapi webhook received: ${type}`, call?.id);
     
@@ -408,6 +609,7 @@ app.post('/api/webhook/vapi', (req, res) => {
           ourCallData.frontendStatus = 'calling';
           console.log(`Webhook: Call ${ourCallId} started`);
           break;
+          
         case 'call-end':
           ourCallData.status = 'ended';
           ourCallData.frontendStatus = 'completed';
@@ -416,10 +618,41 @@ app.post('/api/webhook/vapi', (req, res) => {
             ourCallData.transcript = formatTranscript(call.transcript);
             console.log(`Webhook: Call ${ourCallId} ended with transcript`);
           }
+          
+          // Download recording when call ends
+          if (call.recordingEnabled !== false) {
+            setTimeout(async () => {
+              const recordingPath = await downloadRecording(call.id, ourCallId);
+              if (recordingPath) {
+                ourCallData.recordingPath = recordingPath;
+                ourCallData.recordingAvailable = true;
+                callDatabase.set(ourCallId, ourCallData);
+                console.log(`Recording downloaded for call ${ourCallId}`);
+              }
+            }, 10000); // Wait 5 seconds for recording to be available
+          }
           break;
+          
         case 'transcript':
-          // Real-time transcript updates could be stored here
+          // Real-time transcript updates
           console.log(`Webhook: Transcript update for call ${ourCallId}`);
+          if (message && message.transcript) {
+            // Could store partial transcripts here for real-time display
+          }
+          break;
+          
+        case 'speech-start':
+        case 'speech-end':
+          // Could be used for live audio indicators
+          console.log(`Webhook: Speech event ${type} for call ${ourCallId}`);
+          break;
+          
+        case 'message':
+          // Handle real-time messages/audio if provided
+          if (message && message.audio) {
+            // Forward audio data to live listeners
+            broadcastAudioToListeners(ourCallId, Buffer.from(message.audio, 'base64'));
+          }
           break;
       }
       
@@ -509,6 +742,7 @@ app.get('/api/call-history', (req, res) => {
       createdAt: call.createdAt,
       completedAt: call.completedAt,
       duration: call.duration,
+      recordingAvailable: call.recordingAvailable || false,
     }))
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     
@@ -521,12 +755,14 @@ app.get('/api/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     totalCalls: callDatabase.size,
+    activeConnections: Array.from(liveConnections.keys()).length,
     config: {
       vapiApiKey: VAPI_API_KEY ? 'Configured' : 'Missing',
       vapiPhoneNumberId: VAPI_PHONE_NUMBER_ID ? 'Configured' : 'Missing',
       vapiAssistantId: VAPI_ASSISTANT_ID ? 'Configured' : 'Missing',
       supportPhoneNumber: SUPPORT_PHONE_NUMBER ? 'Configured' : 'Missing',
       mockMode: process.env.MOCK_MODE === 'true',
+      recordingsDir: recordingsDir,
     }
   });
 });
@@ -541,14 +777,17 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Support Bridge API server running on port ${PORT}`);
   console.log(`📞 Configured to call: ${SUPPORT_PHONE_NUMBER}`);
   console.log(`🔑 Vapi API Key: ${VAPI_API_KEY ? 'Configured' : 'Missing'}`);
   console.log(`📱 Vapi Phone Number ID: ${VAPI_PHONE_NUMBER_ID ? 'Configured' : 'Missing'}`);
   console.log(`🤖 Vapi Assistant ID: ${VAPI_ASSISTANT_ID ? 'Configured' : 'Missing'}`);
   console.log(`🧪 Mock Mode: ${process.env.MOCK_MODE === 'true' ? 'Enabled' : 'Disabled'}`);
+  console.log(`🎵 WebSocket Audio Streaming: Enabled`);
+  console.log(`💾 Recordings Directory: ${recordingsDir}`);
   console.log(`\n📋 Webhook URL: http://localhost:${PORT}/api/webhook/vapi`);
+  console.log(`🎧 WebSocket URL: ws://localhost:${PORT}/audio-stream/{callId}`);
 });
 
 module.exports = app;
