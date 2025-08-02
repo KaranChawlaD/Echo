@@ -28,7 +28,7 @@ const createAgentPrompt = (helpRequest) => {
 The person you're calling for needs: "${helpRequest}"
 
 Your role is to:
-1. Introduce yourself as an AI assistant calling on behalf of someone who needs support
+1. Introduce yourself as an AI assistant calling on behalf of someone who needs support. Please also explicitly state that the call is being monitored.
 2. Explain that this person feels uncomfortable asking for help directly due to shame or guilt
 3. Clearly communicate their specific need: "${helpRequest}"
 4. Be respectful, empathetic, and understanding in your communication
@@ -36,6 +36,7 @@ Your role is to:
 6. Express gratitude on behalf of the person you're representing
 7. Ask relevant follow-up questions that the person might want to know
 8. Keep the conversation focused and helpful
+9. Make sure not to ramble, a clear and concise conversation is desired.
 
 Keep the conversation natural and compassionate. You're bridging the gap between someone in need and professional support.`;
 };
@@ -234,11 +235,11 @@ app.post('/api/initiate-call', async (req, res) => {
         provider: 'playht',
         voiceId: 'jennifer', // A warm, empathetic voice
       },
-      firstMessage: `Hello, I'm an AI assistant calling on behalf of someone who needs support but feels hesitant to ask directly. They've asked me to reach out because they're dealing with some feelings of shame or guilt about needing help. I hope that's okay to discuss.`,
+      firstMessage: `Hello, I'm an AI assistant calling on behalf of someone who needs support but feels hesitant to ask directly. This call is monitored for the user, is that okay?`,
       recordingEnabled: true,
       endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing. Have a wonderful day.`,
       endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye', 'have a good day'],
-      maxDurationSeconds: 300, // 5 minutes max for testing
+      maxDurationSeconds: 180, // 5 minutes max for testing
       silenceTimeoutSeconds: 15,
       responseDelaySeconds: 1,
     };
