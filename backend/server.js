@@ -1,10 +1,11 @@
+const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3002;
 
 // Middleware
 app.use(cors());
@@ -59,12 +60,58 @@ app.post('/api/initiate-call', async (req, res) => {
   try {
     const { helpRequest } = req.body;
     
+    console.log('Received help request:', helpRequest); // Debug log
+    
     if (!helpRequest) {
       return res.status(400).json({ error: 'Help request is required' });
     }
 
     const callId = uuidv4();
+    console.log('Generated call ID:', callId); // Debug log
     
+    // For testing without Vapi, you can enable mock mode
+    const MOCK_MODE = process.env.MOCK_MODE === 'true';
+    
+    if (MOCK_MODE) {
+      console.log('Running in mock mode');
+      // Store mock call information
+      callDatabase.set(callId, {
+        id: callId,
+        vapiCallId: 'mock-call-' + callId,
+        assistantId: 'mock-assistant-' + callId,
+        helpRequest,
+        status: 'in_progress',
+        createdAt: new Date().toISOString(),
+        transcript: null,
+      });
+      
+      // Simulate call completion after 10 seconds
+      setTimeout(() => {
+        const mockCall = callDatabase.get(callId);
+        if (mockCall) {
+          mockCall.status = 'completed';
+          mockCall.transcript = `MOCK TRANSCRIPT\n\nAI Agent: Hello, I'm calling on behalf of someone who needs help with: ${helpRequest}\n\nSupport Person: Of course, I'd be happy to help. What specifically do they need?\n\nAI Agent: They mentioned: ${helpRequest}\n\nSupport Person: I understand. Please let them know I'm here to support them.\n\nAI Agent: Thank you so much for your understanding and support.`;
+          mockCall.completedAt = new Date().toISOString();
+          callDatabase.set(callId, mockCall);
+        }
+      }, 10000);
+      
+      return res.json({
+        success: true,
+        callId: callId,
+        message: 'Mock call initiated successfully',
+      });
+    }
+
+    // Real Vapi implementation
+    if (!VAPI_API_KEY) {
+      throw new Error('VAPI_API_KEY is not configured');
+    }
+
+    if (!SUPPORT_PHONE_NUMBER) {
+      throw new Error('SUPPORT_PHONE_NUMBER is not configured');
+    }
+
     // Create Vapi assistant configuration
     const assistantConfig = {
       model: {
@@ -81,15 +128,18 @@ app.post('/api/initiate-call', async (req, res) => {
         provider: 'elevenlabs',
         voiceId: 'pNInz6obpgDQGcFmaJgB', // A warm, empathetic voice
       },
-      firstMessage: 'Hi, I am an AI assistant calling on behalf of someone who needs some support but feels hesitant to ask directly. They have asked me to reach out because they are dealing with some feelings of shame or guilt about needing help. I hope that is okay.',
+      firstMessage: `Hi, I'm an AI assistant calling on behalf of someone who needs some support but feels hesitant to ask directly. They've asked me to reach out because they're dealing with some feelings of shame or guilt about needing help. I hope that's okay.`,
       recordingEnabled: true,
-      endCallMessage: 'Thank you so much for your time and understanding. This conversation means a lot to the person I am representing.',
+      endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing.`,
       endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye'],
       maxDurationSeconds: 1800, // 30 minutes max
     };
 
+    console.log('Creating Vapi assistant...'); // Debug log
+
     // Create the assistant
     const assistant = await makeVapiRequest('assistant', assistantConfig);
+    console.log('Assistant created:', assistant.id); // Debug log
     
     // Initiate the phone call
     const callData = {
@@ -100,7 +150,9 @@ app.post('/api/initiate-call', async (req, res) => {
       },
     };
 
+    console.log('Initiating Vapi call...'); // Debug log
     const call = await makeVapiRequest('call/phone', callData);
+    console.log('Vapi call initiated:', call.id); // Debug log
     
     // Store call information
     callDatabase.set(callId, {
@@ -112,6 +164,8 @@ app.post('/api/initiate-call', async (req, res) => {
       createdAt: new Date().toISOString(),
       transcript: null,
     });
+
+    console.log('Call data stored for ID:', callId); // Debug log
 
     res.json({
       success: true,
@@ -138,6 +192,14 @@ app.get('/api/call-status/:callId', async (req, res) => {
       return res.status(404).json({ error: 'Call not found' });
     }
 
+    // Skip Vapi check in mock mode
+    if (process.env.MOCK_MODE === 'true') {
+      return res.json({
+        status: callData.status === 'completed' ? 'completed' : 'in_progress',
+        transcript: callData.transcript,
+      });
+    }
+    
     // Check status with Vapi
     const vapiResponse = await fetch(`https://api.vapi.ai/call/${callData.vapiCallId}`, {
       headers: {

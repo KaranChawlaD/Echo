@@ -17,7 +17,7 @@ export default function Dashboard() {
     setCallStatus('calling');
     
     try {
-      const response = await fetch('/api/initiate-call', {
+      const response = await fetch('http://localhost:3002/api/initiate-call', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -28,13 +28,16 @@ export default function Dashboard() {
       });
       
       const data = await response.json();
+      console.log('API Response:', data); // Debug log
       
-      if (response.ok) {
+      if (response.ok && data.callId) {
         setCallId(data.callId);
+        console.log('Call ID set:', data.callId); // Debug log
         // Poll for call completion
         pollCallStatus(data.callId);
       } else {
-        throw new Error(data.error || 'Failed to initiate call');
+        console.error('Invalid response:', data);
+        throw new Error(data.error || 'Failed to initiate call - no call ID returned');
       }
     } catch (error) {
       console.error('Error initiating call:', error);
@@ -45,19 +48,37 @@ export default function Dashboard() {
   };
 
   const pollCallStatus = async (callId) => {
+    if (!callId) {
+      console.error('No call ID provided for polling');
+      setCallStatus('error');
+      return;
+    }
+    
+    console.log('Polling call status for ID:', callId); // Debug log
+    
     const checkStatus = async () => {
       try {
-        const response = await fetch(`/api/call-status/${callId}`);
+        const response = await fetch(`http://localhost:3002/api/call-status/${callId}`);
         const data = await response.json();
         
-        if (data.status === 'completed') {
-          setCallStatus('completed');
-          setTranscript(data.transcript);
-        } else if (data.status === 'failed') {
-          setCallStatus('error');
+        console.log('Status check response:', data); // Debug log
+        
+        if (response.ok) {
+          if (data.status === 'completed') {
+            setCallStatus('completed');
+            setTranscript(data.transcript);
+          } else if (data.status === 'failed' || data.status === 'error') {
+            setCallStatus('error');
+          } else if (data.status === 'in_progress' || data.status === 'calling') {
+            // Continue polling
+            setTimeout(checkStatus, 3000);
+          } else {
+            // Continue polling for other statuses
+            setTimeout(checkStatus, 3000);
+          }
         } else {
-          // Continue polling
-          setTimeout(checkStatus, 3000);
+          console.error('Status check failed:', data);
+          setCallStatus('error');
         }
       } catch (error) {
         console.error('Error checking call status:', error);
