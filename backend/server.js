@@ -16,11 +16,14 @@ const callDatabase = new Map();
 
 // Vapi configuration
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
-const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER; // Your friend's number
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID; // Your Vapi phone number ID
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID; // Pre-configured assistant ID
+const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER; // The hotline number to call
+const FLY_MODEL = process.env.FLY_MODEL;
 
 // AI Agent prompt template
 const createAgentPrompt = (helpRequest) => {
-  return `You are a compassionate AI assistant calling on behalf of someone who needs help but feels ashamed or guilty about asking directly. 
+  return `You are a compassionate AI assistant calling a support hotline on behalf of someone who needs help but feels ashamed or guilty about asking directly. 
 
 The person you're calling for needs: "${helpRequest}"
 
@@ -29,28 +32,40 @@ Your role is to:
 2. Explain that this person feels uncomfortable asking for help directly due to shame or guilt
 3. Clearly communicate their specific need: "${helpRequest}"
 4. Be respectful, empathetic, and understanding in your communication
-5. Accept any guidance, advice, or support the person offers
+5. Accept any guidance, advice, or support the hotline offers
 6. Express gratitude on behalf of the person you're representing
+7. Ask relevant follow-up questions that the person might want to know
+8. Keep the conversation focused and helpful
 
-Keep the conversation natural and compassionate. You're bridging the gap between someone in need and someone who can help.`;
+Keep the conversation natural and compassionate. You're bridging the gap between someone in need and professional support.`;
 };
 
-// Vapi API calls
-const makeVapiRequest = async (endpoint, data) => {
-  const response = await fetch(`https://api.vapi.ai/${endpoint}`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${VAPI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(data),
-  });
-  
-  if (!response.ok) {
-    throw new Error(`Vapi API error: ${response.statusText}`);
+// Vapi API calls with better error handling
+const makeVapiRequest = async (endpoint, data, method = 'POST') => {
+  try {
+    console.log(`Making ${method} request to Vapi: ${endpoint}`);
+    
+    const response = await fetch(`https://api.vapi.ai/${endpoint}`, {
+      method: method,
+      headers: {
+        'Authorization': `Bearer ${VAPI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      ...(method !== 'GET' && { body: JSON.stringify(data) }),
+    });
+    
+    const responseData = await response.json();
+    
+    if (!response.ok) {
+      console.error('Vapi API error response:', responseData);
+      throw new Error(`Vapi API error: ${response.status} - ${responseData.message || response.statusText}`);
+    }
+    
+    return responseData;
+  } catch (error) {
+    console.error('Vapi request failed:', error);
+    throw error;
   }
-  
-  return response.json();
 };
 
 // Routes
@@ -60,14 +75,14 @@ app.post('/api/initiate-call', async (req, res) => {
   try {
     const { helpRequest } = req.body;
     
-    console.log('Received help request:', helpRequest); // Debug log
+    console.log('Received help request:', helpRequest);
     
     if (!helpRequest) {
       return res.status(400).json({ error: 'Help request is required' });
     }
 
     const callId = uuidv4();
-    console.log('Generated call ID:', callId); // Debug log
+    console.log('Generated call ID:', callId);
     
     // For testing without Vapi, you can enable mock mode
     const MOCK_MODE = process.env.MOCK_MODE === 'true';
@@ -80,21 +95,38 @@ app.post('/api/initiate-call', async (req, res) => {
         vapiCallId: 'mock-call-' + callId,
         assistantId: 'mock-assistant-' + callId,
         helpRequest,
-        status: 'in_progress',
+        status: 'queued',
         createdAt: new Date().toISOString(),
         transcript: null,
       });
       
-      // Simulate call completion after 10 seconds
+      // Simulate call progression
       setTimeout(() => {
         const mockCall = callDatabase.get(callId);
         if (mockCall) {
-          mockCall.status = 'completed';
-          mockCall.transcript = `MOCK TRANSCRIPT\n\nAI Agent: Hello, I'm calling on behalf of someone who needs help with: ${helpRequest}\n\nSupport Person: Of course, I'd be happy to help. What specifically do they need?\n\nAI Agent: They mentioned: ${helpRequest}\n\nSupport Person: I understand. Please let them know I'm here to support them.\n\nAI Agent: Thank you so much for your understanding and support.`;
+          mockCall.status = 'ringing';
+          callDatabase.set(callId, mockCall);
+        }
+      }, 2000);
+      
+      setTimeout(() => {
+        const mockCall = callDatabase.get(callId);
+        if (mockCall) {
+          mockCall.status = 'in-progress';
+          callDatabase.set(callId, mockCall);
+        }
+      }, 5000);
+      
+      // Simulate call completion after 30 seconds
+      setTimeout(() => {
+        const mockCall = callDatabase.get(callId);
+        if (mockCall) {
+          mockCall.status = 'ended';
+          mockCall.transcript = formatMockTranscript(helpRequest);
           mockCall.completedAt = new Date().toISOString();
           callDatabase.set(callId, mockCall);
         }
-      }, 10000);
+      }, 30000);
       
       return res.json({
         success: true,
@@ -103,7 +135,7 @@ app.post('/api/initiate-call', async (req, res) => {
       });
     }
 
-    // Real Vapi implementation
+    // Validate required environment variables
     if (!VAPI_API_KEY) {
       throw new Error('VAPI_API_KEY is not configured');
     }
@@ -112,11 +144,58 @@ app.post('/api/initiate-call', async (req, res) => {
       throw new Error('SUPPORT_PHONE_NUMBER is not configured');
     }
 
-    // Create Vapi assistant configuration
+    // Option 1: Use pre-configured assistant (recommended)
+    if (VAPI_ASSISTANT_ID && !FLY_MODEL) {
+      console.log('Using pre-configured assistant:', VAPI_ASSISTANT_ID);
+      
+      const callData = {
+        assistantId: VAPI_ASSISTANT_ID,
+        customer: {
+          number: SUPPORT_PHONE_NUMBER,
+        },
+        // Override assistant variables for this specific call
+        assistantOverrides: {
+          variableValues: {
+            helpRequest: helpRequest,
+            userContext: `Someone needs help with: ${helpRequest}`
+          }
+        }
+      };
+
+      // Add phone number ID if provided
+      if (VAPI_PHONE_NUMBER_ID) {
+        callData.phoneNumberId = VAPI_PHONE_NUMBER_ID;
+      }
+
+      console.log('Initiating call with data:', JSON.stringify(callData, null, 2));
+      const call = await makeVapiRequest('call/phone', callData);
+      
+      // Store call information
+      callDatabase.set(callId, {
+        id: callId,
+        vapiCallId: call.id,
+        assistantId: VAPI_ASSISTANT_ID,
+        helpRequest,
+        status: call.status || 'queued',
+        createdAt: new Date().toISOString(),
+        transcript: null,
+      });
+
+      return res.json({
+        success: true,
+        callId: callId,
+        vapiCallId: call.id,
+        message: 'Call initiated successfully',
+      });
+    }
+
+    // Option 2: Create assistant on the fly (if no pre-configured assistant)
+    console.log('Creating new assistant for this call...');
+
     const assistantConfig = {
       model: {
         provider: 'openai',
-        model: 'gpt-4',
+        model: 'gpt-4o-mini',
         messages: [
           {
             role: 'system',
@@ -125,34 +204,38 @@ app.post('/api/initiate-call', async (req, res) => {
         ]
       },
       voice: {
-        provider: 'elevenlabs',
-        voiceId: 'pNInz6obpgDQGcFmaJgB', // A warm, empathetic voice
+        provider: 'playht',
+        voiceId: 'jennifer', // A warm, empathetic voice
       },
-      firstMessage: `Hi, I'm an AI assistant calling on behalf of someone who needs some support but feels hesitant to ask directly. They've asked me to reach out because they're dealing with some feelings of shame or guilt about needing help. I hope that's okay.`,
+      firstMessage: `Hello, I'm an AI assistant calling on behalf of someone who needs support but feels hesitant to ask directly. They've asked me to reach out because they're dealing with some feelings of shame or guilt about needing help. I hope that's okay to discuss.`,
       recordingEnabled: true,
-      endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing.`,
-      endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye'],
-      maxDurationSeconds: 1800, // 30 minutes max
+      endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing. Have a wonderful day.`,
+      endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye', 'have a good day'],
+      maxDurationSeconds: 300, // 30 minutes max
+      silenceTimeoutSeconds: 15,
+      responseDelaySeconds: 1,
     };
-
-    console.log('Creating Vapi assistant...'); // Debug log
 
     // Create the assistant
     const assistant = await makeVapiRequest('assistant', assistantConfig);
-    console.log('Assistant created:', assistant.id); // Debug log
+    console.log('Assistant created:', assistant.id);
     
     // Initiate the phone call
     const callData = {
       assistantId: assistant.id,
-      phoneNumberId: SUPPORT_PHONE_NUMBER,
       customer: {
         number: SUPPORT_PHONE_NUMBER,
       },
     };
 
-    console.log('Initiating Vapi call...'); // Debug log
+    // Add phone number ID if provided
+    if (VAPI_PHONE_NUMBER_ID) {
+      callData.phoneNumberId = VAPI_PHONE_NUMBER_ID;
+    }
+
+    console.log('Initiating Vapi call...');
     const call = await makeVapiRequest('call/phone', callData);
-    console.log('Vapi call initiated:', call.id); // Debug log
+    console.log('Vapi call initiated:', call.id);
     
     // Store call information
     callDatabase.set(callId, {
@@ -160,16 +243,17 @@ app.post('/api/initiate-call', async (req, res) => {
       vapiCallId: call.id,
       assistantId: assistant.id,
       helpRequest,
-      status: 'in_progress',
+      status: call.status || 'queued',
       createdAt: new Date().toISOString(),
       transcript: null,
     });
 
-    console.log('Call data stored for ID:', callId); // Debug log
+    console.log('Call data stored for ID:', callId);
 
     res.json({
       success: true,
       callId: callId,
+      vapiCallId: call.id,
       message: 'Call initiated successfully',
     });
 
@@ -195,63 +279,139 @@ app.get('/api/call-status/:callId', async (req, res) => {
     // Skip Vapi check in mock mode
     if (process.env.MOCK_MODE === 'true') {
       return res.json({
-        status: callData.status === 'completed' ? 'completed' : 'in_progress',
+        status: callData.status,
         transcript: callData.transcript,
+        helpRequest: callData.helpRequest,
+        createdAt: callData.createdAt,
+        completedAt: callData.completedAt,
       });
     }
     
     // Check status with Vapi
-    const vapiResponse = await fetch(`https://api.vapi.ai/call/${callData.vapiCallId}`, {
-      headers: {
-        'Authorization': `Bearer ${VAPI_API_KEY}`,
-      },
-    });
-
-    if (vapiResponse.ok) {
-      const vapiCallData = await vapiResponse.json();
+    try {
+      const vapiCallData = await makeVapiRequest(`call/${callData.vapiCallId}`, null, 'GET');
       
-      // Update our database
+      // Update our database with latest status
       callData.status = vapiCallData.status;
+      callData.duration = vapiCallData.duration;
       
-      if (vapiCallData.status === 'ended' && vapiCallData.transcript) {
-        callData.transcript = formatTranscript(vapiCallData.transcript);
-        callData.completedAt = new Date().toISOString();
+      // If call ended, get transcript
+      if (vapiCallData.status === 'ended') {
+        if (vapiCallData.transcript) {
+          callData.transcript = formatTranscript(vapiCallData.transcript);
+        }
+        if (vapiCallData.endedReason) {
+          callData.endedReason = vapiCallData.endedReason;
+        }
+        if (!callData.completedAt) {
+          callData.completedAt = new Date().toISOString();
+        }
       }
       
       callDatabase.set(callId, callData);
       
       res.json({
-        status: vapiCallData.status === 'ended' ? 'completed' : vapiCallData.status,
+        status: callData.status,
         transcript: callData.transcript,
+        helpRequest: callData.helpRequest,
+        createdAt: callData.createdAt,
+        completedAt: callData.completedAt,
+        duration: callData.duration,
+        endedReason: callData.endedReason,
       });
-    } else {
-      res.status(500).json({ error: 'Failed to check call status' });
+      
+    } catch (vapiError) {
+      console.error('Error fetching from Vapi:', vapiError);
+      // Return what we have in our database
+      res.json({
+        status: callData.status,
+        transcript: callData.transcript,
+        helpRequest: callData.helpRequest,
+        createdAt: callData.createdAt,
+        completedAt: callData.completedAt,
+        error: 'Could not fetch latest status from Vapi',
+      });
     }
 
   } catch (error) {
     console.error('Error checking call status:', error);
-    res.status(500).json({ error: 'Failed to check call status' });
+    res.status(500).json({ 
+      error: 'Failed to check call status',
+      details: error.message 
+    });
+  }
+});
+
+// Webhook endpoint for real-time updates
+app.post('/api/webhook/vapi', (req, res) => {
+  try {
+    const { type, call } = req.body;
+    
+    console.log(`Vapi webhook received: ${type}`, call?.id);
+    
+    // Find the call in our database by Vapi call ID
+    let ourCallData = null;
+    let ourCallId = null;
+    
+    for (const [id, data] of callDatabase.entries()) {
+      if (data.vapiCallId === call?.id) {
+        ourCallData = data;
+        ourCallId = id;
+        break;
+      }
+    }
+    
+    if (ourCallData) {
+      // Update status based on webhook
+      switch (type) {
+        case 'call-start':
+          ourCallData.status = 'in-progress';
+          break;
+        case 'call-end':
+          ourCallData.status = 'ended';
+          ourCallData.completedAt = new Date().toISOString();
+          if (call.transcript) {
+            ourCallData.transcript = formatTranscript(call.transcript);
+          }
+          break;
+        case 'transcript':
+          // Real-time transcript updates could be stored here
+          break;
+      }
+      
+      callDatabase.set(ourCallId, ourCallData);
+    }
+    
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(200).json({ received: true, error: error.message });
   }
 });
 
 // Format transcript for readability
 const formatTranscript = (rawTranscript) => {
-  if (!rawTranscript || !Array.isArray(rawTranscript)) {
+  if (!rawTranscript) {
     return 'Transcript not available';
   }
 
   let formatted = 'SUPPORT CALL TRANSCRIPT\n';
   formatted += '========================\n\n';
   formatted += `Date: ${new Date().toLocaleString()}\n`;
-  formatted += 'Participants: AI Support Agent & Support Person\n\n';
+  formatted += 'Participants: AI Support Agent & Support Hotline\n\n';
   formatted += 'CONVERSATION:\n';
   formatted += '-------------\n\n';
 
-  rawTranscript.forEach((entry, index) => {
-    const speaker = entry.role === 'assistant' ? 'AI Agent' : 'Support Person';
-    const timestamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
-    formatted += `[${timestamp}] ${speaker}: ${entry.text}\n\n`;
-  });
+  // Handle different transcript formats
+  if (Array.isArray(rawTranscript)) {
+    rawTranscript.forEach((entry) => {
+      const speaker = entry.role === 'assistant' ? 'AI Agent' : 'Support Person';
+      const timestamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
+      formatted += `[${timestamp}] ${speaker}: ${entry.text || entry.content}\n\n`;
+    });
+  } else if (typeof rawTranscript === 'string') {
+    formatted += rawTranscript + '\n\n';
+  }
 
   formatted += '\n--- End of Transcript ---\n';
   formatted += '\nThis conversation was conducted by an AI agent on behalf of someone seeking support.\n';
@@ -260,15 +420,51 @@ const formatTranscript = (rawTranscript) => {
   return formatted;
 };
 
-// Get call history (optional feature)
+// Create mock transcript for testing
+const formatMockTranscript = (helpRequest) => {
+  return `SUPPORT CALL TRANSCRIPT (MOCK)
+========================
+
+Date: ${new Date().toLocaleString()}
+Participants: AI Support Agent & Support Hotline
+
+CONVERSATION:
+-------------
+
+[${new Date().toLocaleTimeString()}] AI Agent: Hello, I'm an AI assistant calling on behalf of someone who needs support but feels hesitant to ask directly. They've asked me to reach out because they're dealing with some feelings of shame or guilt about needing help. I hope that's okay to discuss.
+
+[${new Date().toLocaleTimeString()}] Support Person: Of course, that's exactly what we're here for. It takes courage to reach out, even through an AI assistant. What kind of support are they looking for?
+
+[${new Date().toLocaleTimeString()}] AI Agent: They mentioned: ${helpRequest}
+
+[${new Date().toLocaleTimeString()}] Support Person: I understand. That's something we help people with regularly. Please let them know that what they're going through is valid, and there's no shame in needing support.
+
+[${new Date().toLocaleTimeString()}] AI Agent: That means so much. They were really worried about being judged. What would be the best next steps for someone in their situation?
+
+[${new Date().toLocaleTimeString()}] Support Person: We have several resources available. I'd recommend they call us directly when they feel ready, or we can connect them with local services. Would they be interested in some written resources I could provide?
+
+[${new Date().toLocaleTimeString()}] AI Agent: That would be wonderful. Thank you so much for your patience and understanding. This conversation will mean a lot to them.
+
+[${new Date().toLocaleTimeString()}] Support Person: Please remind them that seeking help is a sign of strength, not weakness. We're here whenever they're ready.
+
+--- End of Transcript ---
+
+This conversation was conducted by an AI agent on behalf of someone seeking support.
+The AI agent represented their needs with empathy and respect.`;
+};
+
+// Get call history
 app.get('/api/call-history', (req, res) => {
   const calls = Array.from(callDatabase.values())
     .map(call => ({
       id: call.id,
-      helpRequest: call.helpRequest.substring(0, 100) + '...',
+      helpRequest: call.helpRequest.length > 100 ? 
+        call.helpRequest.substring(0, 100) + '...' : 
+        call.helpRequest,
       status: call.status,
       createdAt: call.createdAt,
       completedAt: call.completedAt,
+      duration: call.duration,
     }))
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     
@@ -281,6 +477,13 @@ app.get('/api/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     totalCalls: callDatabase.size,
+    config: {
+      vapiApiKey: VAPI_API_KEY ? 'Configured' : 'Missing',
+      vapiPhoneNumberId: VAPI_PHONE_NUMBER_ID ? 'Configured' : 'Missing',
+      vapiAssistantId: VAPI_ASSISTANT_ID ? 'Configured' : 'Missing',
+      supportPhoneNumber: SUPPORT_PHONE_NUMBER ? 'Configured' : 'Missing',
+      mockMode: process.env.MOCK_MODE === 'true',
+    }
   });
 });
 
@@ -296,8 +499,12 @@ app.use((err, req, res, next) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Support Bridge API server running on port ${PORT}`);
-  console.log(`📞 Configured for calls to: ${SUPPORT_PHONE_NUMBER}`);
+  console.log(`📞 Configured to call: ${SUPPORT_PHONE_NUMBER}`);
   console.log(`🔑 Vapi API Key: ${VAPI_API_KEY ? 'Configured' : 'Missing'}`);
+  console.log(`📱 Vapi Phone Number ID: ${VAPI_PHONE_NUMBER_ID ? 'Configured' : 'Missing'}`);
+  console.log(`🤖 Vapi Assistant ID: ${VAPI_ASSISTANT_ID ? 'Configured' : 'Missing'}`);
+  console.log(`🧪 Mock Mode: ${process.env.MOCK_MODE === 'true' ? 'Enabled' : 'Disabled'}`);
+  console.log(`\n📋 Webhook URL: http://localhost:${PORT}/api/webhook/vapi`);
 });
 
 module.exports = app;
