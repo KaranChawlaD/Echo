@@ -2,6 +2,8 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const WebSocket = require('ws');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
@@ -13,12 +15,13 @@ app.use(express.json());
 
 // In-memory storage for call data (use a database in production)
 const callDatabase = new Map();
+const activeWebSockets = new Map(); // Store active WebSocket connections
 
 // Vapi configuration
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
-const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID; // Your Vapi phone number ID
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID; // Pre-configured assistant ID
-const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER; // The hotline number to call
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID;
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
+const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER;
 const FLY_MODEL = process.env.FLY_MODEL;
 
 // AI Agent prompt template
@@ -86,7 +89,105 @@ const makeVapiRequest = async (endpoint, data, method = 'POST') => {
   }
 };
 
-// Routes
+// Function to connect to WebSocket and handle audio streaming
+const connectToCallWebSocket = (callId, listenUrl) => {
+  if (!listenUrl) {
+    console.log(`No listen URL provided for call ${callId}`);
+    return;
+  }
+
+  console.log(`🔌 Connecting to WebSocket for call ${callId}: ${listenUrl}`);
+  
+  try {
+    const websocket = new WebSocket(listenUrl, {
+      headers: {
+        'Authorization': `Bearer ${VAPI_API_KEY}`
+      }
+    });
+    let pcmBuffer = Buffer.alloc(0);
+    
+    // Store the WebSocket connection
+    activeWebSockets.set(callId, {
+      ws: websocket,
+      buffer: pcmBuffer,
+      connected: false
+    });
+
+    websocket.on('open', () => {
+      console.log(`📡 WebSocket connection opened for call: ${callId}`);
+      const wsData = activeWebSockets.get(callId);
+      if (wsData) {
+        wsData.connected = true;
+        activeWebSockets.set(callId, wsData);
+      }
+    });
+
+    websocket.on('message', (data, isBinary) => {
+      const wsData = activeWebSockets.get(callId);
+      if (!wsData) return;
+
+      if (isBinary) {
+        // Handle PCM audio data
+        wsData.buffer = Buffer.concat([wsData.buffer, data]);
+        console.log(`📊 Received PCM data for call ${callId}, buffer size: ${wsData.buffer.length}`);
+        activeWebSockets.set(callId, wsData);
+      } else {
+        // Handle text messages (control messages, metadata, etc.)
+        try {
+          const message = JSON.parse(data.toString());
+          console.log(`📨 Received WebSocket message for call ${callId}:`, message);
+          
+          // Handle different message types
+          if (message.type === 'transcript') {
+            // Update call data with real-time transcript
+            const callData = callDatabase.get(callId);
+            if (callData) {
+              callData.liveTranscript = message.transcript;
+              callDatabase.set(callId, callData);
+            }
+          }
+        } catch (error) {
+          console.log(`📨 Received non-JSON message for call ${callId}:`, data.toString());
+        }
+      }
+    });
+
+    websocket.on('close', (code, reason) => {
+      console.log(`🔌 WebSocket closed for call ${callId}. Code: ${code}, Reason: ${reason}`);
+      
+      const wsData = activeWebSockets.get(callId);
+      if (wsData && wsData.buffer.length > 0) {
+        // Save audio data when connection closes
+        const audioFileName = `audio_${callId}_${Date.now()}.pcm`;
+        fs.writeFileSync(audioFileName, wsData.buffer);
+        console.log(`💾 Audio data saved to ${audioFileName} (${wsData.buffer.length} bytes)`);
+        
+        // Update call data with audio file path
+        const callData = callDatabase.get(callId);
+        if (callData) {
+          callData.audioFile = audioFileName;
+          callDatabase.set(callId, callData);
+        }
+      }
+      
+      // Clean up
+      activeWebSockets.delete(callId);
+    });
+
+    websocket.on('error', (error) => {
+      console.error(`❌ WebSocket error for call ${callId}:`, error);
+      
+      // Clean up on error
+      const wsData = activeWebSockets.get(callId);
+      if (wsData) {
+        activeWebSockets.delete(callId);
+      }
+    });
+
+  } catch (error) {
+    console.error(`❌ Failed to create WebSocket connection for call ${callId}:`, error);
+  }
+};
 
 // Initiate a support call
 app.post('/api/initiate-call', async (req, res) => {
@@ -114,7 +215,7 @@ app.post('/api/initiate-call', async (req, res) => {
         assistantId: 'mock-assistant-' + callId,
         helpRequest,
         status: 'queued',
-        frontendStatus: 'calling', // Add frontend-friendly status
+        frontendStatus: 'calling',
         createdAt: new Date().toISOString(),
         transcript: null,
       });
@@ -151,7 +252,7 @@ app.post('/api/initiate-call', async (req, res) => {
           callDatabase.set(callId, mockCall);
           console.log(`Mock call ${callId} completed with transcript`);
         }
-      }, 15000); // Reduced from 30 seconds to 15 for faster testing
+      }, 15000);
       
       return res.json({
         success: true,
@@ -193,7 +294,10 @@ app.post('/api/initiate-call', async (req, res) => {
       }
 
       console.log('Initiating call with data:', JSON.stringify(callData, null, 2));
-      const call = await makeVapiRequest('call/phone', callData);
+      const response = await makeVapiRequest('call/phone', callData);
+      const call = response.call || response; // Handle different response formats
+      
+      console.log('Vapi call response:', call);
       
       const initialStatus = call.status || 'queued';
       
@@ -207,13 +311,28 @@ app.post('/api/initiate-call', async (req, res) => {
         frontendStatus: mapVapiStatusToFrontend(initialStatus),
         createdAt: new Date().toISOString(),
         transcript: null,
+        listenUrl: call.monitor?.listenUrl, // Handle different field names
       });
+
+      // Connect to WebSocket if listen URL is available
+      if (call.status === 'in-progress' && call.monitor?.listenUrl) {
+        const listenUrl = call.monitor?.listenUrl;
+        console.log(`🎧 Listen URL available for call ${callId}: ${listenUrl}`);
+        
+        // Small delay to ensure call is fully initialized
+        setTimeout(() => {
+          connectToCallWebSocket(callId, listenUrl);
+        }, 1000);
+      } else {
+        console.log(`⚠️ No listen URL provided for call ${callId}`);
+      }
 
       return res.json({
         success: true,
         callId: callId,
         vapiCallId: call.id,
         message: 'Call initiated successfully',
+        hasAudioStream: !!(call.monitor?.listenUrl),
       });
     }
 
@@ -233,13 +352,13 @@ app.post('/api/initiate-call', async (req, res) => {
       },
       voice: {
         provider: 'playht',
-        voiceId: 'jennifer', // A warm, empathetic voice
+        voiceId: 'jennifer',
       },
       firstMessage: `Hello, I'm an AI assistant calling on behalf of someone who needs support but feels hesitant to ask directly. This call is monitored for the user, is that okay?`,
       recordingEnabled: true,
       endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing. Have a wonderful day.`,
       endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye', 'have a good day'],
-      maxDurationSeconds: 180, // 5 minutes max for testing
+      maxDurationSeconds: 180,
       silenceTimeoutSeconds: 15,
       responseDelaySeconds: 1,
     };
@@ -263,7 +382,7 @@ app.post('/api/initiate-call', async (req, res) => {
 
     console.log('Initiating Vapi call...');
     const call = await makeVapiRequest('call/phone', callData);
-    console.log('Vapi call initiated:', call.id);
+    console.log('Call data:', call);
     
     const initialStatus = call.status || 'queued';
     
@@ -277,7 +396,20 @@ app.post('/api/initiate-call', async (req, res) => {
       frontendStatus: mapVapiStatusToFrontend(initialStatus),
       createdAt: new Date().toISOString(),
       transcript: null,
+      listenUrl: call.monitor?.listenUrl,
     });
+
+    // Connect to WebSocket if listen URL is available
+    if (call.status === 'in-progress' && call.monitor?.listenUrl) {
+      const listenUrl = call.monitor.listenUrl;
+      console.log(`🎧 Listen URL available for call ${callId}: ${listenUrl}`);
+      
+      setTimeout(() => {
+        connectToCallWebSocket(callId, listenUrl);
+      }, 1000);
+    } else {
+      console.log(`⚠️ No listen URL provided for call ${callId}`);
+    }
 
     console.log('Call data stored for ID:', callId);
 
@@ -286,6 +418,7 @@ app.post('/api/initiate-call', async (req, res) => {
       callId: callId,
       vapiCallId: call.id,
       message: 'Call initiated successfully',
+      hasAudioStream: !!(call.monitor?.listenUrl),
     });
 
   } catch (error) {
@@ -310,15 +443,22 @@ app.get('/api/call-status/:callId', async (req, res) => {
       return res.status(404).json({ error: 'Call not found' });
     }
 
+    // Check WebSocket status
+    const wsData = activeWebSockets.get(callId);
+    const websocketStatus = wsData ? (wsData.connected ? 'connected' : 'connecting') : 'disconnected';
+
     // Skip Vapi check in mock mode
     if (process.env.MOCK_MODE === 'true') {
       console.log(`Mock mode status for ${callId}:`, callData.frontendStatus);
       return res.json({
         status: callData.frontendStatus,
         transcript: callData.transcript,
+        liveTranscript: callData.liveTranscript,
         helpRequest: callData.helpRequest,
         createdAt: callData.createdAt,
         completedAt: callData.completedAt,
+        websocketStatus: 'mock',
+        audioFile: callData.audioFile,
       });
     }
     
@@ -350,13 +490,16 @@ app.get('/api/call-status/:callId', async (req, res) => {
       callDatabase.set(callId, callData);
       
       res.json({
-        status: callData.frontendStatus, // Use frontend-friendly status
+        status: callData.frontendStatus,
         transcript: callData.transcript,
+        liveTranscript: callData.liveTranscript,
         helpRequest: callData.helpRequest,
         createdAt: callData.createdAt,
         completedAt: callData.completedAt,
         duration: callData.duration,
         endedReason: callData.endedReason,
+        websocketStatus: websocketStatus,
+        audioFile: callData.audioFile,
       });
       
     } catch (vapiError) {
@@ -365,9 +508,12 @@ app.get('/api/call-status/:callId', async (req, res) => {
       res.json({
         status: callData.frontendStatus,
         transcript: callData.transcript,
+        liveTranscript: callData.liveTranscript,
         helpRequest: callData.helpRequest,
         createdAt: callData.createdAt,
         completedAt: callData.completedAt,
+        websocketStatus: websocketStatus,
+        audioFile: callData.audioFile,
         error: 'Could not fetch latest status from Vapi',
       });
     }
@@ -419,6 +565,9 @@ app.post('/api/webhook/vapi', (req, res) => {
           break;
         case 'transcript':
           // Real-time transcript updates could be stored here
+          if (call.transcript) {
+            ourCallData.liveTranscript = call.transcript;
+          }
           console.log(`Webhook: Transcript update for call ${ourCallId}`);
           break;
       }
@@ -431,6 +580,24 @@ app.post('/api/webhook/vapi', (req, res) => {
     console.error('Webhook error:', error);
     res.status(200).json({ received: true, error: error.message });
   }
+});
+
+// Add endpoint to get WebSocket status
+app.get('/api/websocket-status/:callId', (req, res) => {
+  const { callId } = req.params;
+  const wsData = activeWebSockets.get(callId);
+  
+  if (!wsData) {
+    return res.json({
+      status: 'disconnected',
+      bufferSize: 0,
+    });
+  }
+  
+  res.json({
+    status: wsData.connected ? 'connected' : 'connecting',
+    bufferSize: wsData.buffer.length,
+  });
 });
 
 // Format transcript for readability
@@ -509,6 +676,7 @@ app.get('/api/call-history', (req, res) => {
       createdAt: call.createdAt,
       completedAt: call.completedAt,
       duration: call.duration,
+      hasAudio: !!call.audioFile,
     }))
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     
@@ -521,6 +689,7 @@ app.get('/api/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     totalCalls: callDatabase.size,
+    activeWebSockets: activeWebSockets.size,
     config: {
       vapiApiKey: VAPI_API_KEY ? 'Configured' : 'Missing',
       vapiPhoneNumberId: VAPI_PHONE_NUMBER_ID ? 'Configured' : 'Missing',
@@ -529,6 +698,38 @@ app.get('/api/health', (req, res) => {
       mockMode: process.env.MOCK_MODE === 'true',
     }
   });
+});
+
+// Cleanup function for graceful shutdown
+const cleanup = () => {
+  console.log('\n🧹 Cleaning up WebSocket connections...');
+  
+  for (const [callId, wsData] of activeWebSockets.entries()) {
+    if (wsData.ws && wsData.ws.readyState === WebSocket.OPEN) {
+      wsData.ws.close();
+    }
+    
+    // Save any remaining audio data
+    if (wsData.buffer && wsData.buffer.length > 0) {
+      const audioFileName = `audio_${callId}_${Date.now()}.pcm`;
+      fs.writeFileSync(audioFileName, wsData.buffer);
+      console.log(`💾 Saved audio data for call ${callId} to ${audioFileName}`);
+    }
+  }
+  
+  activeWebSockets.clear();
+  console.log('✅ Cleanup completed');
+};
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  cleanup();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  cleanup();
+  process.exit(0);
 });
 
 // Error handling middleware
