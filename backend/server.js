@@ -2,6 +2,7 @@ const fetch = require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const { WebSocketServer } = require('ws');
 require('dotenv').config();
 
 const app = express();
@@ -16,10 +17,15 @@ const callDatabase = new Map();
 
 // Vapi configuration
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
-const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID; // Your Vapi phone number ID
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID; // Pre-configured assistant ID
-const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER; // The hotline number to call
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID;
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
+const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER;
 const FLY_MODEL = process.env.FLY_MODEL;
+const VAPI_BASE_URL = "https://api.vapi.ai";
+const POLL_INTERVAL_MS = 3000;
+
+// WebSocket clients tracking
+const clients = new Set();
 
 // AI Agent prompt template
 const createAgentPrompt = (helpRequest) => {
@@ -41,7 +47,109 @@ Your role is to:
 Keep the conversation natural and compassionate. You're bridging the gap between someone in need and professional support.`;
 };
 
-// Status mapping function to normalize Vapi statuses to frontend-expected statuses
+// WebSocket broadcasting function
+function broadcastEvent(event) {
+  const data = JSON.stringify(event);
+  for (const ws of clients) {
+    if (ws.readyState === 1) { // WebSocket.OPEN
+      try {
+        ws.send(data);
+      } catch (error) {
+        console.error('Error sending WebSocket message:', error);
+        clients.delete(ws);
+      }
+    }
+  }
+}
+
+// Polling function for call status
+async function pollCall(callId, vapiCallId) {
+  try {
+    const response = await fetch(`${VAPI_BASE_URL}/call/${vapiCallId}`, {
+      headers: {
+        Authorization: `Bearer ${VAPI_API_KEY}`,
+      },
+    });
+
+    const callData = await response.json();
+    
+    if (!callData) {
+      return;
+    }
+    
+    console.log("Call data status:", callData.status);
+    
+    // Get our stored call data
+    const ourCallData = callDatabase.get(callId);
+    if (!ourCallData) return;
+    
+    // Update status and broadcast events
+    const previousStatus = ourCallData.status;
+    ourCallData.status = callData.status;
+    ourCallData.frontendStatus = mapVapiStatusToFrontend(callData.status);
+    
+    // Broadcast status changes
+    if (callData.status === 'ringing' && previousStatus !== 'ringing') {
+      broadcastEvent({ type: "ringing", callId });
+    } else if (callData.status === 'in-progress' && previousStatus !== 'in-progress') {
+      broadcastEvent({ type: "in-progress", callId });
+    }
+    
+    // Check for new messages and broadcast them
+    if (callData.messages && Array.isArray(callData.messages)) {
+      const previousMessageTimes = ourCallData.previousMessageTimes || new Set();
+      const newMessages = callData.messages.filter(msg => 
+        !previousMessageTimes.has(msg.time) && msg.role !== "system"
+      );
+      
+      newMessages.forEach((msg) => {
+        previousMessageTimes.add(msg.time);
+        broadcastEvent({ 
+          type: 'message', 
+          text: msg.message,
+          role: msg.role,
+          callId 
+        });
+      });
+      
+      ourCallData.previousMessageTimes = previousMessageTimes;
+    }
+    
+    // Handle call completion
+    if (callData.status === 'ended' && !ourCallData.callEnded) {
+      ourCallData.callEnded = true;
+      ourCallData.completedAt = new Date().toISOString();
+      
+      broadcastEvent({ type: 'call_ended', callId });
+      
+      // Process transcript
+      if (callData.messages) {
+        const transcript = formatTranscriptFromMessages(callData.messages, ourCallData.helpRequest);
+        ourCallData.transcript = transcript;
+        
+        broadcastEvent({ 
+          type: 'transcript_ready', 
+          transcript: transcript,
+          callId 
+        });
+      }
+      
+      // Stop polling for this call
+      if (ourCallData.pollingInterval) {
+        clearInterval(ourCallData.pollingInterval);
+      }
+    }
+    
+    // Update database
+    callDatabase.set(callId, ourCallData);
+    
+  } catch (err) {
+    console.error("Polling error:", err);
+    broadcastEvent({ type: 'call_error', error: err.message, callId });
+  }
+}
+
+// Status mapping function
 const mapVapiStatusToFrontend = (vapiStatus) => {
   const statusMap = {
     'queued': 'calling',
@@ -58,7 +166,7 @@ const mapVapiStatusToFrontend = (vapiStatus) => {
   return statusMap[vapiStatus] || 'calling';
 };
 
-// Vapi API calls with better error handling
+// Enhanced VAPI request function
 const makeVapiRequest = async (endpoint, data, method = 'POST') => {
   try {
     console.log(`Making ${method} request to Vapi: ${endpoint}`);
@@ -86,8 +194,6 @@ const makeVapiRequest = async (endpoint, data, method = 'POST') => {
   }
 };
 
-// Routes
-
 // Initiate a support call
 app.post('/api/initiate-call', async (req, res) => {
   try {
@@ -102,31 +208,34 @@ app.post('/api/initiate-call', async (req, res) => {
     const callId = uuidv4();
     console.log('Generated call ID:', callId);
     
-    // For testing without Vapi, you can enable mock mode
+    // Mock mode for testing
     const MOCK_MODE = process.env.MOCK_MODE === 'true';
     
     if (MOCK_MODE) {
       console.log('Running in mock mode');
-      // Store mock call information
-      callDatabase.set(callId, {
+      
+      const mockCallData = {
         id: callId,
         vapiCallId: 'mock-call-' + callId,
         assistantId: 'mock-assistant-' + callId,
         helpRequest,
         status: 'queued',
-        frontendStatus: 'calling', // Add frontend-friendly status
+        frontendStatus: 'calling',
         createdAt: new Date().toISOString(),
         transcript: null,
-      });
+        callEnded: false,
+        previousMessageTimes: new Set(),
+      };
       
-      // Simulate call progression
+      callDatabase.set(callId, mockCallData);
+      
+      // Simulate call progression with broadcasting
       setTimeout(() => {
         const mockCall = callDatabase.get(callId);
         if (mockCall) {
           mockCall.status = 'ringing';
-          mockCall.frontendStatus = 'calling';
+          broadcastEvent({ type: 'ringing', callId });
           callDatabase.set(callId, mockCall);
-          console.log(`Mock call ${callId} status: ringing`);
         }
       }, 2000);
       
@@ -134,24 +243,49 @@ app.post('/api/initiate-call', async (req, res) => {
         const mockCall = callDatabase.get(callId);
         if (mockCall) {
           mockCall.status = 'in-progress';
-          mockCall.frontendStatus = 'calling';
+          broadcastEvent({ type: 'in-progress', callId });
           callDatabase.set(callId, mockCall);
-          console.log(`Mock call ${callId} status: in-progress`);
         }
       }, 5000);
       
-      // Simulate call completion after 15 seconds for testing
+      // Simulate messages
+      setTimeout(() => {
+        broadcastEvent({ 
+          type: 'message', 
+          text: 'AI Agent: Hello, I\'m calling on behalf of someone who needs support...',
+          role: 'assistant',
+          callId 
+        });
+      }, 7000);
+      
+      setTimeout(() => {
+        broadcastEvent({ 
+          type: 'message', 
+          text: 'Support Person: Of course, we\'re here to help. What can we do?',
+          role: 'user',
+          callId 
+        });
+      }, 10000);
+      
+      // Simulate call completion
       setTimeout(() => {
         const mockCall = callDatabase.get(callId);
-        if (mockCall) {
+        if (mockCall && !mockCall.callEnded) {
           mockCall.status = 'ended';
           mockCall.frontendStatus = 'completed';
+          mockCall.callEnded = true;
           mockCall.transcript = formatMockTranscript(helpRequest);
           mockCall.completedAt = new Date().toISOString();
           callDatabase.set(callId, mockCall);
-          console.log(`Mock call ${callId} completed with transcript`);
+          
+          broadcastEvent({ type: 'call_ended', callId });
+          broadcastEvent({ 
+            type: 'transcript_ready', 
+            transcript: mockCall.transcript,
+            callId 
+          });
         }
-      }, 15000); // Reduced from 30 seconds to 15 for faster testing
+      }, 15000);
       
       return res.json({
         success: true,
@@ -160,7 +294,7 @@ app.post('/api/initiate-call', async (req, res) => {
       });
     }
 
-    // Validate required environment variables
+    // Real VAPI call logic
     if (!VAPI_API_KEY) {
       throw new Error('VAPI_API_KEY is not configured');
     }
@@ -169,122 +303,84 @@ app.post('/api/initiate-call', async (req, res) => {
       throw new Error('SUPPORT_PHONE_NUMBER is not configured');
     }
 
-    // Option 1: Use pre-configured assistant (recommended)
-    if (VAPI_ASSISTANT_ID && !FLY_MODEL) {
-      console.log('Using pre-configured assistant:', VAPI_ASSISTANT_ID);
-      
-      const callData = {
-        assistantId: VAPI_ASSISTANT_ID,
-        customer: {
-          number: SUPPORT_PHONE_NUMBER,
+    let vapiCallId;
+    let assistantId = VAPI_ASSISTANT_ID;
+
+    // Create assistant if needed
+    if (!assistantId) {
+      const assistantConfig = {
+        model: {
+          provider: 'openai',
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: createAgentPrompt(helpRequest)
+            }
+          ]
         },
-        // Override assistant variables for this specific call
-        assistantOverrides: {
-          variableValues: {
-            helpRequest: helpRequest,
-            userContext: `Someone needs help with: ${helpRequest}`
-          }
-        }
+        voice: {
+          provider: 'playht',
+          voiceId: 'jennifer',
+        },
+        firstMessage: `Hello, I'm an AI assistant calling on behalf of someone who needs support but feels hesitant to ask directly. This call is monitored for the user, is that okay?`,
+        recordingEnabled: true,
+        endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing. Have a wonderful day.`,
+        endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye', 'have a good day'],
+        maxDurationSeconds: 300,
+        silenceTimeoutSeconds: 15,
+        responseDelaySeconds: 1,
       };
 
-      // Add phone number ID if provided
-      if (VAPI_PHONE_NUMBER_ID) {
-        callData.phoneNumberId = VAPI_PHONE_NUMBER_ID;
-      }
-
-      console.log('Initiating call with data:', JSON.stringify(callData, null, 2));
-      const call = await makeVapiRequest('call/phone', callData);
-      
-      const initialStatus = call.status || 'queued';
-      
-      // Store call information
-      callDatabase.set(callId, {
-        id: callId,
-        vapiCallId: call.id,
-        assistantId: VAPI_ASSISTANT_ID,
-        helpRequest,
-        status: initialStatus,
-        frontendStatus: mapVapiStatusToFrontend(initialStatus),
-        createdAt: new Date().toISOString(),
-        transcript: null,
-      });
-
-      return res.json({
-        success: true,
-        callId: callId,
-        vapiCallId: call.id,
-        message: 'Call initiated successfully',
-      });
+      const assistant = await makeVapiRequest('assistant', assistantConfig);
+      assistantId = assistant.id;
     }
-
-    // Option 2: Create assistant on the fly (if no pre-configured assistant)
-    console.log('Creating new assistant for this call...');
-
-    const assistantConfig = {
-      model: {
-        provider: 'openai',
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: createAgentPrompt(helpRequest)
-          }
-        ]
-      },
-      voice: {
-        provider: 'playht',
-        voiceId: 'jennifer', // A warm, empathetic voice
-      },
-      firstMessage: `Hello, I'm an AI assistant calling on behalf of someone who needs support but feels hesitant to ask directly. This call is monitored for the user, is that okay?`,
-      recordingEnabled: true,
-      endCallMessage: `Thank you so much for your time and understanding. This conversation means a lot to the person I'm representing. Have a wonderful day.`,
-      endCallPhrases: ['goodbye', 'talk to you later', 'take care', 'bye', 'have a good day'],
-      maxDurationSeconds: 180, // 5 minutes max for testing
-      silenceTimeoutSeconds: 15,
-      responseDelaySeconds: 1,
-    };
-
-    // Create the assistant
-    const assistant = await makeVapiRequest('assistant', assistantConfig);
-    console.log('Assistant created:', assistant.id);
     
-    // Initiate the phone call
+    // Initiate the call
     const callData = {
-      assistantId: assistant.id,
+      assistantId: assistantId,
       customer: {
         number: SUPPORT_PHONE_NUMBER,
       },
     };
 
-    // Add phone number ID if provided
     if (VAPI_PHONE_NUMBER_ID) {
       callData.phoneNumberId = VAPI_PHONE_NUMBER_ID;
     }
 
-    console.log('Initiating Vapi call...');
     const call = await makeVapiRequest('call/phone', callData);
-    console.log('Vapi call initiated:', call.id);
-    
-    const initialStatus = call.status || 'queued';
+    vapiCallId = call.id;
     
     // Store call information
-    callDatabase.set(callId, {
+    const callInfo = {
       id: callId,
-      vapiCallId: call.id,
-      assistantId: assistant.id,
+      vapiCallId: vapiCallId,
+      assistantId: assistantId,
       helpRequest,
-      status: initialStatus,
-      frontendStatus: mapVapiStatusToFrontend(initialStatus),
+      status: call.status || 'queued',
+      frontendStatus: mapVapiStatusToFrontend(call.status || 'queued'),
       createdAt: new Date().toISOString(),
       transcript: null,
-    });
-
-    console.log('Call data stored for ID:', callId);
+      callEnded: false,
+      previousMessageTimes: new Set(),
+      listenUrl: call.monitor?.listenUrl || null,
+    };
+    
+    callDatabase.set(callId, callInfo);
+    
+    // Start polling for this call
+    const pollingInterval = setInterval(() => {
+      pollCall(callId, vapiCallId);
+    }, POLL_INTERVAL_MS);
+    
+    callInfo.pollingInterval = pollingInterval;
+    callDatabase.set(callId, callInfo);
 
     res.json({
       success: true,
       callId: callId,
-      vapiCallId: call.id,
+      vapiCallId: vapiCallId,
+      listenUrl: callInfo.listenUrl,
       message: 'Call initiated successfully',
     });
 
@@ -297,80 +393,26 @@ app.post('/api/initiate-call', async (req, res) => {
   }
 });
 
-// Check call status
+// Check call status (enhanced with real-time data)
 app.get('/api/call-status/:callId', async (req, res) => {
   try {
     const { callId } = req.params;
     const callData = callDatabase.get(callId);
     
-    console.log(`Status check for call ID: ${callId}`);
-    
     if (!callData) {
-      console.log(`Call not found: ${callId}`);
       return res.status(404).json({ error: 'Call not found' });
     }
 
-    // Skip Vapi check in mock mode
-    if (process.env.MOCK_MODE === 'true') {
-      console.log(`Mock mode status for ${callId}:`, callData.frontendStatus);
-      return res.json({
-        status: callData.frontendStatus,
-        transcript: callData.transcript,
-        helpRequest: callData.helpRequest,
-        createdAt: callData.createdAt,
-        completedAt: callData.completedAt,
-      });
-    }
-    
-    // Check status with Vapi
-    try {
-      const vapiCallData = await makeVapiRequest(`call/${callData.vapiCallId}`, null, 'GET');
-      
-      console.log(`Vapi status for ${callId}:`, vapiCallData.status);
-      
-      // Update our database with latest status
-      callData.status = vapiCallData.status;
-      callData.frontendStatus = mapVapiStatusToFrontend(vapiCallData.status);
-      callData.duration = vapiCallData.duration;
-      
-      // If call ended, get transcript
-      if (vapiCallData.status === 'ended') {
-        if (vapiCallData.transcript) {
-          callData.transcript = formatTranscript(vapiCallData.transcript);
-          console.log(`Transcript available for call ${callId}`);
-        }
-        if (vapiCallData.endedReason) {
-          callData.endedReason = vapiCallData.endedReason;
-        }
-        if (!callData.completedAt) {
-          callData.completedAt = new Date().toISOString();
-        }
-      }
-      
-      callDatabase.set(callId, callData);
-      
-      res.json({
-        status: callData.frontendStatus, // Use frontend-friendly status
-        transcript: callData.transcript,
-        helpRequest: callData.helpRequest,
-        createdAt: callData.createdAt,
-        completedAt: callData.completedAt,
-        duration: callData.duration,
-        endedReason: callData.endedReason,
-      });
-      
-    } catch (vapiError) {
-      console.error('Error fetching from Vapi:', vapiError);
-      // Return what we have in our database
-      res.json({
-        status: callData.frontendStatus,
-        transcript: callData.transcript,
-        helpRequest: callData.helpRequest,
-        createdAt: callData.createdAt,
-        completedAt: callData.completedAt,
-        error: 'Could not fetch latest status from Vapi',
-      });
-    }
+    res.json({
+      status: callData.frontendStatus,
+      transcript: callData.transcript,
+      helpRequest: callData.helpRequest,
+      createdAt: callData.createdAt,
+      completedAt: callData.completedAt,
+      listenUrl: callData.listenUrl,
+      duration: callData.duration,
+      endedReason: callData.endedReason,
+    });
 
   } catch (error) {
     console.error('Error checking call status:', error);
@@ -381,6 +423,47 @@ app.get('/api/call-status/:callId', async (req, res) => {
   }
 });
 
+// End call endpoint
+app.post('/api/end-call/:callId', async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const callData = callDatabase.get(callId);
+    
+    if (!callData) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+
+    if (process.env.MOCK_MODE === 'true') {
+      // Handle mock call ending
+      callData.status = 'ended';
+      callData.frontendStatus = 'completed';
+      callData.callEnded = true;
+      callDatabase.set(callId, callData);
+      broadcastEvent({ type: 'call_ended', callId });
+      return res.json({ message: 'Mock call ended successfully' });
+    }
+
+    // End real VAPI call
+    await fetch(`${VAPI_BASE_URL}/call/${callData.vapiCallId}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${VAPI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        status: 'ended'
+      })
+    });
+
+    broadcastEvent({ type: 'call_ended', callId });
+    res.json({ message: 'Call ended successfully' });
+    
+  } catch (error) {
+    console.error('Error ending call:', error);
+    res.status(500).json({ error: 'Error ending call' });
+  }
+});
+
 // Webhook endpoint for real-time updates
 app.post('/api/webhook/vapi', (req, res) => {
   try {
@@ -388,7 +471,7 @@ app.post('/api/webhook/vapi', (req, res) => {
     
     console.log(`Vapi webhook received: ${type}`, call?.id);
     
-    // Find the call in our database by Vapi call ID
+    // Find our call and broadcast the event
     let ourCallData = null;
     let ourCallId = null;
     
@@ -401,25 +484,44 @@ app.post('/api/webhook/vapi', (req, res) => {
     }
     
     if (ourCallData) {
+      // Broadcast webhook events to connected clients
+      broadcastEvent({ 
+        type: `webhook_${type}`, 
+        callId: ourCallId,
+        data: call 
+      });
+      
       // Update status based on webhook
       switch (type) {
         case 'call-start':
           ourCallData.status = 'in-progress';
           ourCallData.frontendStatus = 'calling';
-          console.log(`Webhook: Call ${ourCallId} started`);
+          broadcastEvent({ type: 'in-progress', callId: ourCallId });
           break;
         case 'call-end':
           ourCallData.status = 'ended';
           ourCallData.frontendStatus = 'completed';
           ourCallData.completedAt = new Date().toISOString();
+          ourCallData.callEnded = true;
           if (call.transcript) {
             ourCallData.transcript = formatTranscript(call.transcript);
-            console.log(`Webhook: Call ${ourCallId} ended with transcript`);
           }
+          broadcastEvent({ type: 'call_ended', callId: ourCallId });
+          broadcastEvent({ 
+            type: 'transcript_ready', 
+            transcript: ourCallData.transcript,
+            callId: ourCallId 
+          });
           break;
         case 'transcript':
-          // Real-time transcript updates could be stored here
-          console.log(`Webhook: Transcript update for call ${ourCallId}`);
+          // Real-time transcript updates
+          if (call.transcript) {
+            broadcastEvent({ 
+              type: 'live_transcript', 
+              transcript: call.transcript,
+              callId: ourCallId 
+            });
+          }
           break;
       }
       
@@ -432,6 +534,31 @@ app.post('/api/webhook/vapi', (req, res) => {
     res.status(200).json({ received: true, error: error.message });
   }
 });
+
+// Format transcript from messages
+const formatTranscriptFromMessages = (messages, helpRequest) => {
+  let formatted = 'SUPPORT CALL TRANSCRIPT\n';
+  formatted += '========================\n\n';
+  formatted += `Date: ${new Date().toLocaleString()}\n`;
+  formatted += 'Participants: AI Support Agent & Support Hotline\n';
+  formatted += `Request: ${helpRequest}\n\n`;
+  formatted += 'CONVERSATION:\n';
+  formatted += '-------------\n\n';
+
+  const filteredMessages = messages.filter(msg => msg.role !== "system");
+  
+  filteredMessages.forEach((entry) => {
+    const speaker = entry.role === 'assistant' ? 'AI Agent' : 'Support Person';
+    const timestamp = entry.time ? new Date(entry.time).toLocaleTimeString() : '';
+    formatted += `[${timestamp}] ${speaker}: ${entry.message}\n\n`;
+  });
+
+  formatted += '\n--- End of Transcript ---\n';
+  formatted += '\nThis conversation was conducted by an AI agent on behalf of someone seeking support.\n';
+  formatted += 'The AI agent represented their needs with empathy and respect.';
+
+  return formatted;
+};
 
 // Format transcript for readability
 const formatTranscript = (rawTranscript) => {
@@ -446,7 +573,6 @@ const formatTranscript = (rawTranscript) => {
   formatted += 'CONVERSATION:\n';
   formatted += '-------------\n\n';
 
-  // Handle different transcript formats
   if (Array.isArray(rawTranscript)) {
     rawTranscript.forEach((entry) => {
       const speaker = entry.role === 'assistant' ? 'AI Agent' : 'Support Person';
@@ -521,6 +647,7 @@ app.get('/api/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     totalCalls: callDatabase.size,
+    activeClients: clients.size,
     config: {
       vapiApiKey: VAPI_API_KEY ? 'Configured' : 'Missing',
       vapiPhoneNumberId: VAPI_PHONE_NUMBER_ID ? 'Configured' : 'Missing',
@@ -540,8 +667,8 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
-app.listen(PORT, () => {
+// Start HTTP server
+const server = app.listen(PORT, () => {
   console.log(`🚀 Support Bridge API server running on port ${PORT}`);
   console.log(`📞 Configured to call: ${SUPPORT_PHONE_NUMBER}`);
   console.log(`🔑 Vapi API Key: ${VAPI_API_KEY ? 'Configured' : 'Missing'}`);
@@ -550,5 +677,42 @@ app.listen(PORT, () => {
   console.log(`🧪 Mock Mode: ${process.env.MOCK_MODE === 'true' ? 'Enabled' : 'Disabled'}`);
   console.log(`\n📋 Webhook URL: http://localhost:${PORT}/api/webhook/vapi`);
 });
+
+// WebSocket server setup
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+wss.on("connection", (ws) => {
+  console.log('New WebSocket client connected');
+  clients.add(ws);
+  
+  // Send current call statuses to new client
+  const activeCalls = Array.from(callDatabase.values())
+    .filter(call => call.frontendStatus === 'calling')
+    .map(call => ({
+      type: 'call_status',
+      callId: call.id,
+      status: call.frontendStatus
+    }));
+  
+  activeCalls.forEach(status => {
+    try {
+      ws.send(JSON.stringify(status));
+    } catch (error) {
+      console.error('Error sending initial status:', error);
+    }
+  });
+  
+  ws.on("close", () => {
+    console.log('WebSocket client disconnected');
+    clients.delete(ws);
+  });
+  
+  ws.on("error", (error) => {
+    console.error('WebSocket error:', error);
+    clients.delete(ws);
+  });
+});
+
+console.log(`🔌 WebSocket server running on ws://localhost:${PORT}/ws`);
 
 module.exports = app;
