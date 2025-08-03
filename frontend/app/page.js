@@ -5,6 +5,7 @@ import { Phone, Download, MessageSquare, Heart, Clock, CheckCircle, AlertCircle,
 
 export default function Dashboard() {
   const [helpRequest, setHelpRequest] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [callStatus, setCallStatus] = useState('idle'); // idle, calling, completed, error
   const [transcript, setTranscript] = useState(null);
@@ -20,7 +21,8 @@ export default function Dashboard() {
 
   const handleSubmitRequest = async () => {
     if (!helpRequest.trim()) return;
-    
+    if (!phoneNumber.trim()) return;
+
     setIsLoading(true);
     setCallStatus('calling');
     setDebugInfo('');
@@ -35,6 +37,7 @@ export default function Dashboard() {
         },
         body: JSON.stringify({
           helpRequest: helpRequest.trim(),
+          phoneNumber: "+1" + phoneNumber.trim(),
         }),
       });
       
@@ -125,6 +128,7 @@ export default function Dashboard() {
 
   const resetForm = () => {
     setHelpRequest('');
+    setPhoneNumber('')
     setCallStatus('idle');
     setTranscript(null);
     setCallId(null);
@@ -206,9 +210,23 @@ export default function Dashboard() {
             {callStatus === 'idle' && (
               <div className="space-y-6">
                 <div>
-                  <label htmlFor="helpRequest" className="block text-lg font-medium text-[#03060f] mb-3">
-                    What help do you need?
-                  </label>
+                  <div className='flex justify-between items-center'>
+                    <label htmlFor="helpRequest" className="block text-lg font-medium text-[#03060f]">
+                      What help do you need?
+                    </label>
+                    <div className='flex justify-between items-center'>
+                      <Phone className='h-5 w-5 text-[#3b5bd9]'/>
+                      <label htmlFor='phoneNumber' className="block text-base font-medium text-[#03060f] mr-1">
+                        +1
+                      </label>
+                      <textarea id='phoneNumber' 
+                        value={phoneNumber} 
+                        onChange={(e) => setPhoneNumber(e.target.value)} 
+                        placeholder="2345678900"
+                        className='text-[#03060f] h-6 w-25 pl-1 border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#3b5bd9] focus:outline-none focus:border-transparent resize-none overflow-hidden'
+                        />
+                    </div>
+                  </div>
                   <textarea
                     id="helpRequest"
                     value={helpRequest}
@@ -221,7 +239,7 @@ export default function Dashboard() {
                 <div className="flex justify-center">
                   <button
                     onClick={handleSubmitRequest}
-                    disabled={!helpRequest.trim() || isLoading}
+                    disabled={!helpRequest.trim() || isLoading || !phoneNumber.trim()}
                     className="flex items-center gap-3 px-8 py-3 bg-[#3b5bd9] text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   >
                     <Phone className="w-5 h-5" />

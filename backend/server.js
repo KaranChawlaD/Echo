@@ -18,7 +18,7 @@ const callDatabase = new Map();
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
 const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID; // Your Vapi phone number ID
 const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID; // Pre-configured assistant ID
-const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER; // The hotline number to call
+// const SUPPORT_PHONE_NUMBER = process.env.SUPPORT_PHONE_NUMBER; // The hotline number to call
 const FLY_MODEL = process.env.FLY_MODEL;
 
 // AI Agent prompt template
@@ -37,6 +37,7 @@ Your role is to:
 7. Ask relevant follow-up questions that the person might want to know
 8. Keep the conversation focused and helpful
 9. Make sure not to ramble, a clear and concise conversation is desired.
+10. Do not stop talking if you hear slight sounds in the background.
 
 Keep the conversation natural and compassionate. You're bridging the gap between someone in need and professional support.`;
 };
@@ -91,7 +92,10 @@ const makeVapiRequest = async (endpoint, data, method = 'POST') => {
 // Initiate a support call
 app.post('/api/initiate-call', async (req, res) => {
   try {
-    const { helpRequest } = req.body;
+    const helpRequest = req.body.helpRequest;
+    const phoneNumber = req.body.phoneNumber;
+
+    const SUPPORT_PHONE_NUMBER = phoneNumber;
     
     console.log('Received help request:', helpRequest);
     
@@ -543,7 +547,7 @@ app.use((err, req, res, next) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Support Bridge API server running on port ${PORT}`);
-  console.log(`📞 Configured to call: ${SUPPORT_PHONE_NUMBER}`);
+  // console.log(`📞 Configured to call: ${SUPPORT_PHONE_NUMBER}`);
   console.log(`🔑 Vapi API Key: ${VAPI_API_KEY ? 'Configured' : 'Missing'}`);
   console.log(`📱 Vapi Phone Number ID: ${VAPI_PHONE_NUMBER_ID ? 'Configured' : 'Missing'}`);
   console.log(`🤖 Vapi Assistant ID: ${VAPI_ASSISTANT_ID ? 'Configured' : 'Missing'}`);
