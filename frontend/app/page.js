@@ -168,8 +168,8 @@ export default function Dashboard() {
     }
 
     // --- Configuration ---
-    const GOOGLE_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_API_KEY; // IMPORTANT: Replace with your actual API key
-    const ai = new GoogleGenAI({ apiKey: "AIzaSyDmaGKI915UHZOgaTxaHVFp3XOIFbZ9Fh8" }); // Fake apiKey for those wondering
+    // const GOOGLE_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_API_KEY; // IMPORTANT: Replace with your actual API key
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }); // Fake apiKey for those wondering
     const availableVoices = ['Zephyr', 'Puck']; // A pool of voices to use
 
     // 2. Identify unique speakers from the transcript
