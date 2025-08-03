@@ -108,20 +108,101 @@ export default function Dashboard() {
     checkStatus();
   };
 
-  const downloadTranscript = () => {
-    if (!transcript) return;
+  const downloadTranscript = async () => {
+  if (!transcript) return;
+  
+  // Download text transcript (existing functionality)
+  const textBlob = new Blob([transcript], { type: 'text/plain' });
+  const textUrl = URL.createObjectURL(textBlob);
+  const textLink = document.createElement('a');
+  textLink.href = textUrl;
+  textLink.download = `support-call-transcript-${new Date().toISOString().split('T')[0]}.txt`;
+  document.body.appendChild(textLink);
+  textLink.click();
+  document.body.removeChild(textLink);
+  URL.revokeObjectURL(textUrl);
+  
+  // Generate and download MP3 audio file
+  try {
+    addDebugInfo('Generating audio file...');
+    const audioBlob = await textToSpeechDownload(transcript);
     
-    const blob = new Blob([transcript], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `support-call-transcript-${new Date().toISOString().split('T')[0]}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    addDebugInfo('Transcript downloaded');
-  };
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audioLink = document.createElement('a');
+    audioLink.href = audioUrl;
+    audioLink.download = `support-call-audio-${new Date().toISOString().split('T')[0]}.mp3`;
+    document.body.appendChild(audioLink);
+    audioLink.click();
+    document.body.removeChild(audioLink);
+    URL.revokeObjectURL(audioUrl);
+    
+    addDebugInfo('Transcript and audio downloaded');
+  } catch (error) {
+    console.error('Error generating audio:', error);
+    addDebugInfo('Transcript downloaded (audio generation failed)');
+  }
+};
+
+// Function to convert text to speech and return as blob (no playback)
+const textToSpeechDownload = (text) => {
+  return new Promise((resolve, reject) => {
+    if (!('speechSynthesis' in window)) {
+      reject(new Error('Speech synthesis not supported'));
+      return;
+    }
+
+    // Create an audio context for recording
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // Create a destination for our audio stream
+    const dest = audioContext.createMediaStreamDestination();
+    
+    // Create MediaRecorder to capture the synthesized speech
+    const mediaRecorder = new MediaRecorder(dest.stream, {
+      mimeType: 'audio/webm' // Most browsers support this
+    });
+    
+    const audioChunks = [];
+    
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        audioChunks.push(event.data);
+      }
+    };
+    
+    mediaRecorder.onstop = async () => {
+      const audioBlob = new Blob(audioChunks, { type: 'audio/mp3' });
+      audioContext.close();
+      resolve(audioBlob);
+    };
+    
+    // Create utterance but don't let it play through speakers
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.volume = 0; // Silent - we're only recording
+    
+    utterance.onstart = () => {
+      mediaRecorder.start();
+    };
+    
+    utterance.onend = () => {
+      // Add small delay to ensure all audio is captured
+      setTimeout(() => {
+        mediaRecorder.stop();
+      }, 500);
+    };
+    
+    utterance.onerror = (error) => {
+      mediaRecorder.stop();
+      audioContext.close();
+      reject(error);
+    };
+    
+    // Start the speech synthesis (silently)
+    speechSynthesis.speak(utterance);
+  });
+};
 
   const resetForm = () => {
     setHelpRequest('');
