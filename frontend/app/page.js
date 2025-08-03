@@ -286,8 +286,8 @@ export default function Dashboard() {
                   {transcript && (
                     <div className="bg-white p-4 rounded border mb-4">
                       <h5 className="font-medium text-gray-800 mb-2">Transcript Preview:</h5>
-                      <p className="text-sm text-gray-600 line-clamp-3">
-                        {transcript.substring(0, 200)}...
+                      <p className="text-sm text-gray-600 line-clamp-5">
+                        {transcript.substring(100, 600)}...
                       </p>
                     </div>
                   )}
