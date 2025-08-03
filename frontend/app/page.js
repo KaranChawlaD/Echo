@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { GoogleGenAI } from "@google/genai";
 import {
   Phone,
   Download,
@@ -10,6 +11,7 @@ import {
   CheckCircle,
   AlertCircle,
   RefreshCw,
+  FileAudio,
 } from "lucide-react";
 
 export default function Dashboard() {
@@ -129,6 +131,8 @@ export default function Dashboard() {
   const downloadTranscript = () => {
     if (!transcript) return;
 
+    localStorage.setItem('savedTranscript', transcript);
+
     const blob = new Blob([transcript], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -142,6 +146,99 @@ export default function Dashboard() {
     URL.revokeObjectURL(url);
     addDebugInfo("Transcript downloaded");
   };
+
+  // Helper to convert Base64 to a Blob for downloading
+  function base64ToBlob(base64, contentType = 'audio/wav') {
+    const byteCharacters = atob(base64);
+    const byteNumbers = new Array(byteCharacters.length);
+    for (let i = 0; i < byteCharacters.length; i++) {
+      byteNumbers[i] = byteCharacters.charCodeAt(i);
+    }
+    const byteArray = new Uint8Array(byteNumbers);
+    return new Blob([byteArray], { type: contentType });
+  }
+
+  async function generateAndDownloadAudio() {
+    // 1. Get the transcript from local storage
+    const savedTranscript = localStorage.getItem('savedTranscript');
+    if (!savedTranscript) {
+      console.error("No transcript found in local storage.");
+      alert("Could not find a saved transcript to generate audio.");
+      return;
+    }
+
+    // --- Configuration ---
+    const GOOGLE_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_API_KEY; // IMPORTANT: Replace with your actual API key
+    const ai = new GoogleGenAI({ apiKey: "AIzaSyDmaGKI915UHZOgaTxaHVFp3XOIFbZ9Fh8" });
+    const availableVoices = ['Zephyr', 'Puck']; // A pool of voices to use
+
+    // 2. Identify unique speakers from the transcript
+    const speakerRegex = /^([a-zA-Z0-9]+):/gm;
+    const speakers = [...new Set(savedTranscript.match(speakerRegex))].map(s => s.slice(0, -1));
+
+    if (speakers.length === 0) {
+        alert("Could not identify any speakers in the format 'Name: text'.");
+        return;
+    }
+
+    // 3. Assign a voice to each speaker
+    const speakerVoiceConfigs = speakers.map((speaker, index) => ({
+      speaker: speaker,
+      voiceConfig: {
+        prebuiltVoiceConfig: {
+          // Assign a voice from the pool, looping if necessary
+          voiceName: availableVoices[index % availableVoices.length]
+        }
+      }
+    }));
+
+    console.log("Identified speakers and assigned voices:", speakerVoiceConfigs);
+
+    try {
+      // 4. Generate the multi-speaker audio content
+      console.log("Requesting audio from API...");
+      const prompt = `TTS the following conversation:\n\n${savedTranscript}`;
+      const response = await ai.models.generateContent({
+          model: "gemini-2.5-flash-preview-tts",
+          contents: [{ parts: [{ text: prompt }] }],
+          config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: [
+                        {
+                           speaker: 'AI',
+                           voiceConfig: {
+                              prebuiltVoiceConfig: { voiceName: 'Zephyr' }
+                           }
+                        },
+                        {
+                           speaker: 'User',
+                           voiceConfig: {
+                              prebuiltVoiceConfig: { voiceName: 'Puck' }
+                           }
+                        }
+                      ]
+          }
+      });
+
+      // 5. Create a downloadable file from the response
+      const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      const blob = base64ToBlob(data, 'audio/wav');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+
+      a.href = url;
+      a.download = `conversation-${new Date().toISOString().split("T")[0]}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      console.log("WAV file download initiated.");
+
+    } catch (error) {
+      console.error("Error generating or downloading audio:", error);
+      alert("An error occurred while generating the audio. Check the console for details.");
+    }
+  }
 
   const resetForm = () => {
     setHelpRequest("");
@@ -244,7 +341,7 @@ export default function Dashboard() {
                       What help do you need?
                     </label>
                     <div className="flex justify-between items-center">
-                      <Phone className="h-5 w-5 text-[#3b5bd9]" />
+                      <Phone className="h-5 w-5 text-[#da63e1]" />
                       <label
                         htmlFor="phoneNumber"
                         className="block text-base font-medium text-[#03060f] mr-1"
@@ -371,6 +468,14 @@ export default function Dashboard() {
                     >
                       <RefreshCw className="w-4 h-4" />
                       New Request
+                    </button>
+
+                    <button
+                      onClick={generateAndDownloadAudio}
+                      className="flex items-center gap-2 px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+                    >
+                      <FileAudio className="w-4 h-4"/>
+                      Download Audio
                     </button>
                   </div>
                 </div>
